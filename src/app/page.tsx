@@ -1400,10 +1400,10 @@ export default function Home() {
                         <td className="font-mono">{(alpha.turnover * 100).toFixed(1)}%</td>
                         <td className="font-mono">{alpha.margin.toFixed(2)}</td>
                         <td>
-                          {alpha.checks.length > 0 ? (
-                            alpha.checks.every(c => c.result === 'PASS') ?
+                          {(alpha.checks?.length ?? 0) > 0 ? (
+                            (alpha.checks ?? []).every(c => c.result === 'PASS') ?
                               <span className="badge badge-success">ALL PASS</span> :
-                              <span className="badge badge-error">{alpha.checks.filter(c => c.result === 'FAIL').length} FAIL</span>
+                              <span className="badge badge-error">{(alpha.checks ?? []).filter(c => c.result === 'FAIL').length} FAIL</span>
                           ) : <span className="badge badge-neutral">N/A</span>}
                         </td>
                         <td>
@@ -1508,11 +1508,11 @@ export default function Home() {
                         <span className="text-xs text-gray-400">Total Warehouse Size</span>
                         <span className="text-xs font-mono text-cyan-400">{(persistenceStats.warehouse.totalSizeBytes / 1024).toFixed(1)} KB</span>
                       </div>
-                      {persistenceStats.warehouse.tables.length > 0 && (
+                      {(persistenceStats.warehouse.tables || []).length > 0 && (
                         <div>
                           <span className="text-xs text-gray-400 block mb-1">Registered Tables:</span>
                           <div className="flex flex-wrap gap-1">
-                            {persistenceStats.warehouse.tables.map(t => (
+                            {(persistenceStats.warehouse.tables || []).map(t => (
                               <span key={t} className="text-xs font-mono bg-gray-800 px-1.5 py-0.5 rounded text-gray-300">{t}</span>
                             ))}
                           </div>
