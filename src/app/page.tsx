@@ -1250,8 +1250,8 @@ export default function Home() {
                   <div className="metric-label">Failed</div>
                   <div className="metric-value text-red-400">{researchStatus.failedSimulations}</div>
                 </div>
-              </div>
-            )}
+</div>
+              )}
 
             {/* Generation Stats Chart */}
             {researchStatus?.generationStats && researchStatus.generationStats.length > 0 && (

@@ -164,6 +164,17 @@ export class AlphaDatabase {
 
     this.dbPath = dbPath || path.join(dataDir, 'alpha_factory.db');
 
+    // Clean stale lock files from previous crash or improper shutdown
+    const staleLocks = [this.dbPath + '-shm', this.dbPath + '-wal', this.dbPath + '-journal'];
+    for (const lockPath of staleLocks) {
+      if (fs.existsSync(lockPath)) {
+        try {
+          fs.unlinkSync(lockPath);
+          console.log(`[Database] Removed stale lock: ${path.basename(lockPath)}`);
+        } catch { /* ignore - another process may have it */ }
+      }
+    }
+
     // Open connection (creates file if not exists)
     this.db = new Database(this.dbPath);
 
@@ -1115,4 +1126,22 @@ export function getDatabase(): AlphaDatabase {
     dbInstance = new AlphaDatabase();
   }
   return dbInstance;
+}
+
+// Graceful shutdown - release locks on server exit
+function cleanup(): void {
+  if (dbInstance) {
+    try {
+      dbInstance.close();
+      console.log('[Database] Closed on shutdown');
+    } catch (e) {
+      console.warn('[Database] Close error:', e);
+    }
+  }
+}
+
+if (process.env.NODE_ENV !== 'test') {
+  process.on('beforeExit', cleanup);
+  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', cleanup);
 }

@@ -12,7 +12,61 @@ interface AlphaFingerprint {
   semanticEmbedding?: number[];
   category: string;
   style: StylePremia;
+  structuralFingerprint?: StructuralFingerprint;
 }
+
+interface StructuralFingerprint {
+  pattern: string;
+  operators: string[];
+  fields: string[];
+  arity: string;
+  operatorSequence: string[];
+  fieldTransforms: Record<string, string[]>;
+  operatorCategories: Record<string, string>;
+}
+
+const OPERATOR_CATEGORIES: Record<string, string> = {
+  rank: 'normalization',
+  ts_rank: 'normalization',
+  normalize: 'normalization',
+  zscore: 'normalization',
+  scale: 'normalization',
+  quantile: 'normalization',
+  ts_mean: 'aggregation',
+  ts_std_dev: 'aggregation',
+  ts_sum: 'aggregation',
+  ts_product: 'aggregation',
+  ts_delta: 'difference',
+  ts_delay: 'delay',
+  ts_decay_linear: 'decay',
+  ts_decay_exp: 'decay',
+  ts_zscore: 'normalization',
+  ts_scale: 'normalization',
+  ts_corr: 'correlation',
+  ts_covariance: 'correlation',
+  ts_arg_max: 'extreme',
+  ts_arg_min: 'extreme',
+  ts_backfill: 'fill',
+  ts_regression: 'regression',
+  group_neutralize: 'group',
+  group_rank: 'group',
+  group_zscore: 'group',
+  group_mean: 'group',
+  group_scale: 'group',
+  group_backfill: 'group',
+  signed_power: 'transform',
+  power: 'transform',
+  abs: 'transform',
+  log: 'transform',
+  sqrt: 'transform',
+  trade_when: 'conditional',
+  if_else: 'conditional',
+  bucket: 'bucket',
+  vec_avg: 'vector',
+  vec_sum: 'vector',
+  winsorize: 'normalization',
+  ts_quantile: 'normalization',
+};
 
 export class DiversityManager {
   private fingerprints: Map<string, AlphaFingerprint> = new Map();
@@ -38,7 +92,7 @@ export class DiversityManager {
     maxPerCategory?: number;
     maxPerStyle?: number;
   } = {}) {
-    this.maxCorrelation = config.maxCorrelation || 0.7;
+    this.maxCorrelation = config.maxCorrelation || 0.65;
     this.maxPerCategory = config.maxPerCategory || 50;
     this.maxPerStyle = config.maxPerStyle || 30;
   }
@@ -116,6 +170,124 @@ export class DiversityManager {
     }
 
     return tokens;
+  }
+
+  // --- Structural Fingerprint (Phase 1) ---
+
+  extractStructuralFingerprint(expression: string): StructuralFingerprint {
+    const operators: string[] = [];
+    const fields: string[] = [];
+    const operatorSequence: string[] = [];
+    const fieldTransforms: Record<string, string[]> = {};
+    const operatorCategories: Record<string, string> = {};
+
+    const opRegex = /\b([a-z_][a-z0-9_]*)\s*\(/g;
+    let match;
+    const stack: string[] = [];
+    while ((match = opRegex.exec(expression)) !== null) {
+      const op = match[1];
+      operators.push(op);
+      operatorSequence.push(op);
+      operatorCategories[op] = OPERATOR_CATEGORIES[op] || 'custom';
+      stack.push(op);
+    }
+
+    const fieldRegex = /\b([A-Z][a-zA-Z0-9_]+)\b/g;
+    while ((match = fieldRegex.exec(expression)) !== null) {
+      if (!match[1].match(/^[A-Z]+$/) || match[1].length > 3) {
+        const field = match[1].toLowerCase();
+        if (!fields.includes(field)) fields.push(field);
+        const currentOp = stack[stack.length - 1];
+        if (currentOp) {
+          if (!fieldTransforms[currentOp]) fieldTransforms[currentOp] = [];
+          if (!fieldTransforms[currentOp].includes(field)) {
+            fieldTransforms[currentOp].push(field);
+          }
+        }
+      }
+    }
+
+    const arity = this.detectArityDynamic(operatorSequence);
+    const pattern = this.generatePatternSignatureDynamic(expression, operators);
+
+    return {
+      pattern,
+      operators: [...new Set(operators)],
+      fields: [...new Set(fields)],
+      arity,
+      operatorSequence,
+      fieldTransforms,
+      operatorCategories,
+    };
+  }
+
+  private detectArityDynamic(operatorSequence: string[]): string {
+    const hasBinaryOp = (expr: string): boolean => {
+      return /[*+/-]/.test(expr);
+    };
+    
+    const hasMultipleRanks = operatorSequence.filter(op => 
+      op === 'rank' || op === 'ts_rank'
+    ).length >= 2;
+
+    if (hasMultipleRanks || operatorSequence.length >= 2) {
+      return 'binary_combine';
+    }
+    return 'unary_chain';
+  }
+
+  private generatePatternSignatureDynamic(expression: string, operators: string[]): string {
+    let sig = expression;
+    
+    const uniqueOps = [...new Set(operators)];
+    for (const op of uniqueOps) {
+      const regex = new RegExp(`${op}\\s*\\([^)]+\\)`, 'gi');
+      sig = sig.replace(regex, `${op.toUpperCase()}(X)`);
+    }
+
+    sig = sig.replace(/volume/gi, 'VOL');
+    sig = sig.replace(/returns/gi, 'RET');
+    sig = sig.replace(/price/gi, 'PRC');
+    sig = sig.replace(/close/gi, 'CLOSE');
+    sig = sig.replace(/open/gi, 'OPEN');
+    sig = sig.replace(/high/gi, 'HIGH');
+    sig = sig.replace(/low/gi, 'LOW');
+    sig = sig.replace(/\b[A-Z][a-zA-Z0-9_]+\b/g, (m) => m.length <= 3 ? m : 'FIELD');
+    sig = sig.replace(/\d+/g, 'N');
+    sig = sig.replace(/\s+/g, ' ').trim();
+    
+    return sig;
+  }
+
+  computeStructuralSimilarity(fp1: StructuralFingerprint, fp2: StructuralFingerprint): number {
+    const opSet1 = new Set(fp1.operators);
+    const opSet2 = new Set(fp2.operators);
+    const opIntersection = [...opSet1].filter(o => opSet2.has(o));
+    const opUnion = new Set([...fp1.operators, ...fp2.operators]);
+    const opScore = opUnion.size > 0 ? opIntersection.length / opUnion.size : 0;
+
+    const categories1 = new Set(Object.values(fp1.operatorCategories));
+    const categories2 = new Set(Object.values(fp2.operatorCategories));
+    const catIntersection = [...categories1].filter(c => categories2.has(c));
+    const catUnion = new Set([...categories1, ...categories2]);
+    const catScore = catUnion.size > 0 ? catIntersection.length / catUnion.size : 0;
+
+    const fieldSet1 = new Set(fp1.fields);
+    const fieldSet2 = new Set(fp2.fields);
+    const fieldIntersection = [...fieldSet1].filter(f => fieldSet2.has(f));
+    const fieldUnion = new Set([...fp1.fields, ...fp2.fields]);
+    const fieldScore = fieldUnion.size > 0 ? fieldIntersection.length / fieldUnion.size : 0;
+
+    let patternBonus = 0;
+    if (fp1.arity === fp2.arity && fp1.arity !== 'unary_chain') {
+      patternBonus = 0.15;
+    }
+
+    if (opScore >= 0.6 && fieldScore >= 0.6) {
+      return Math.min(1.0, opScore * 0.35 + catScore * 0.2 + fieldScore * 0.3 + patternBonus);
+    }
+
+    return opScore * 0.3 + catScore * 0.2 + fieldScore * 0.5;
   }
 
   // --- PCA-based Pre-Simulation Diversity ---
@@ -226,7 +398,6 @@ export class DiversityManager {
    * the old baseline to avoid stale entries.
    */
   async loadSubmittedAlphaCorrelations(alphas: WQAlpha[]): Promise<void> {
-    // If this is a refresh (baseline already loaded), clear old WQ baseline entries
     if (this.wqBaselineAlphaIds.size > 0) {
       for (const id of this.wqBaselineAlphaIds) {
         this.fingerprints.delete(id);
@@ -234,7 +405,6 @@ export class DiversityManager {
       this.wqBaselineAlphaIds.clear();
     }
 
-    // Add fresh baseline
     for (const alpha of alphas) {
       this.fingerprints.set(alpha.id, {
         fingerprint: alpha.id,
@@ -247,9 +417,8 @@ export class DiversityManager {
   }
 
   /**
-   * Evaluate a candidate against the loaded submitted alphas using in-memory
-   * Jaccard similarity. Replaces the DuckDB PCA approach which required
-   * static proxy return data that was never populated.
+   * Evaluate a candidate against the loaded submitted alphas using
+   * Jaccard token similarity (simple operator/field overlap).
    */
    evaluateCandidateWithSubmittedAlphas(candidate: AlphaCandidate): {
      accepted: boolean;
@@ -259,27 +428,21 @@ export class DiversityManager {
      const similarities: Array<{ alphaId: string; similarity: number }> = [];
 
      for (const [alphaId, fp] of this.fingerprints) {
-       // Skip self-matches (candidate fingerprint vs alpha fingerprint)
-       if (alphaId === candidate.fingerprint) continue;
+       // Skip self-matches using fingerprint (not alpha ID)
+       if (fp.fingerprint === candidate.fingerprint) continue;
 
        const similarity = this.computeSemanticSimilarity(candidate.expression, fp.expression);
        similarities.push({ alphaId, similarity });
      }
 
-     // Sort by similarity descending
      similarities.sort((a, b) => b.similarity - a.similarity);
 
-     // Take top-3 matches for reporting
      const top3 = similarities.slice(0, 3);
-
-     // Use MAX similarity (top match) for acceptance decision.
-     // Average of top-3 can dilute a single high correlation and let it pass.
      const maxSimilarity = similarities.length > 0 ? similarities[0].similarity : 0;
      const accepted = maxSimilarity < this.maxCorrelation;
 
      return {
        accepted,
-       // averageSimilarity field now holds max value (kept for compatibility)
        averageSimilarity: maxSimilarity,
        topMatches: top3.slice(0, 5),
      };
@@ -503,15 +666,12 @@ export class DiversityManager {
 
   /**
    * Return a compact summary of recent correlation rejections for LLM prompts.
-   * Example output:
-   *   ## Recent Correlation Rejections (avoid these operator+field patterns):
-   *   Pattern: [rank+ts_std_dev × volume+sector] → 87% correlation
-   *   Pattern: [ts_mean+ts_rank × close+industry] → 82% correlation
+   * Format: Generic pattern-only, no expression details exposed.
    */
   getCorrelationSummary(): string {
     if (this.correlationFeedbackQueue.length === 0) return '';
 
-    const recent = this.correlationFeedbackQueue.slice(-3); // last 3
+    const recent = this.correlationFeedbackQueue.slice(-3);
     const lines = recent.map(r =>
       `Pattern: [${r.patternSignature}] → ${(r.similarity * 100).toFixed(0)}% correlation`
     );

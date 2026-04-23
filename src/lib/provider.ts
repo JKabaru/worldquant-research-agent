@@ -47,9 +47,12 @@ export class ModelProviderClient {
 
     try {
       const response = await this.client.models.list();
+      const modelSet = new Set<string>();
       const models: ModelInfo[] = [];
 
       for (const model of response.data) {
+        if (modelSet.has(model.id)) continue;
+        modelSet.add(model.id);
         models.push({
           id: model.id,
           name: model.id,
@@ -154,7 +157,6 @@ function ensureProvidersRestored(): void {
     }
   }
 }
-ensureProvidersRestored();
 const providerStore = new Map<string, ModelProvider>();
 
 export function saveProvider(provider: ModelProvider): void {
@@ -173,10 +175,12 @@ export function saveProvider(provider: ModelProvider): void {
 }
 
 export function getProvider(id: string): ModelProvider | undefined {
+  ensureProvidersRestored();
   return providerStore.get(id);
 }
 
 export function getAllProviders(): ModelProvider[] {
+  ensureProvidersRestored();
   return Array.from(providerStore.values());
 }
 
