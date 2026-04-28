@@ -14,7 +14,7 @@ export async function GET(request: Request) {
     const offset = parseInt(searchParams.get('offset') || '0');
 
     const client = getWQClient();
-    if (!client.isAuthenticated()) {
+    if (!(await client.ensureAuthenticated())) {
       return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
     }
 

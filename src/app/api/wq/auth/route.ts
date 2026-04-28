@@ -30,7 +30,7 @@ export async function POST(request: Request) {
 export async function GET() {
   try {
     const client = getWQClient();
-    const isAuthenticated = client.isAuthenticated();
+    const isAuthenticated = await client.ensureAuthenticated();
 
     return NextResponse.json({ isAuthenticated });
   } catch (error: unknown) {

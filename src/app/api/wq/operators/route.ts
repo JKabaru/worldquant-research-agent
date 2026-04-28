@@ -5,7 +5,7 @@ import { getWQClient } from '@/lib/wq-client';
 export async function GET() {
   try {
     const client = getWQClient();
-    if (!client.isAuthenticated()) {
+    if (!(await client.ensureAuthenticated())) {
       return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
     }
 

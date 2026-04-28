@@ -310,7 +310,7 @@ export class ResearchEngine {
     if (!this.state.config) throw new Error('Research not configured');
 
     const wqClient = getWQClient();
-    if (!wqClient.isAuthenticated()) throw new Error('Not authenticated with WorldQuant BRAIN');
+    if (!(await wqClient.ensureAuthenticated())) throw new Error('Not authenticated with WorldQuant BRAIN');
     this.ensureProviderConnected();
 
     // Ensure persistence is initialized

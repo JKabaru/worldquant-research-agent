@@ -16,7 +16,7 @@ export async function POST(request: Request) {
     }
 
     const client = getWQClient();
-    if (!client.isAuthenticated()) {
+    if (!(await client.ensureAuthenticated())) {
       return NextResponse.json({ error: 'Not authenticated. Please login first.' }, { status: 401 });
     }
 
@@ -71,7 +71,7 @@ export async function GET(request: Request) {
     }
 
     const client = getWQClient();
-    if (!client.isAuthenticated()) {
+    if (!(await client.ensureAuthenticated())) {
       return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
     }
 

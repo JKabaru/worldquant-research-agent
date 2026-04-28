@@ -8,7 +8,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Missing alphaId' }, { status: 400 });
     }
     const client = getWQClient();
-    if (!client.isAuthenticated()) {
+    if (!(await client.ensureAuthenticated())) {
       return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
     }
     const result = await client.submitAlpha(alphaId);

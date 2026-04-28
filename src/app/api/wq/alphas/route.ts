@@ -13,7 +13,7 @@ export async function GET(request: Request) {
     const order = searchParams.get('order') || undefined;
 
     const client = getWQClient();
-    if (!client.isAuthenticated()) {
+    if (!(await client.ensureAuthenticated())) {
       return NextResponse.json({ error: 'Not authenticated. Please login first.' }, { status: 401 });
     }
 

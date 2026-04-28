@@ -22,9 +22,34 @@ interface WQAPISession {
   headers: Record<string, string>;
 }
 
+interface PersistedWQAuthState {
+  session: WQAPISession | null;
+  credentials: WQCredentials | null;
+}
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __WQ_AUTH_STATE__: PersistedWQAuthState | undefined;
+}
+
 export class WorldQuantBrainClient {
   private session: WQAPISession | null = null;
   private credentials: WQCredentials | null = null;
+
+  constructor() {
+    const persisted = globalThis.__WQ_AUTH_STATE__;
+    if (persisted) {
+      this.session = persisted.session;
+      this.credentials = persisted.credentials;
+    }
+  }
+
+  private persistAuthState(): void {
+    globalThis.__WQ_AUTH_STATE__ = {
+      session: this.session,
+      credentials: this.credentials,
+    };
+  }
 
   private extractPerformanceComparison(payload: Record<string, unknown>): WQPerformanceComparison {
     const perf =
@@ -114,6 +139,7 @@ export class WorldQuantBrainClient {
         'Cookie': cookies,
       },
     };
+    this.persistAuthState();
 
     return {
       isAuthenticated: true,
@@ -126,6 +152,19 @@ export class WorldQuantBrainClient {
     return this.session !== null;
   }
 
+  async ensureAuthenticated(): Promise<boolean> {
+    if (this.session) return true;
+    if (!this.credentials) return false;
+    try {
+      await this.authenticate(this.credentials);
+      return true;
+    } catch {
+      this.session = null;
+      this.persistAuthState();
+      return false;
+    }
+  }
+
   private ensureAuth(): void {
     if (!this.session) throw new Error('Not authenticated. Please log in first.');
   }
@@ -136,6 +175,7 @@ export class WorldQuantBrainClient {
     body?: unknown,
     retries: number = 1
   ): Promise<Response> {
+    await this.ensureAuthenticated();
     this.ensureAuth();
 
     for (let attempt = 0; attempt <= retries; attempt++) {
@@ -484,6 +524,7 @@ export class WorldQuantBrainClient {
   async disconnect(): Promise<void> {
     this.session = null;
     this.credentials = null;
+    this.persistAuthState();
   }
 }
 
