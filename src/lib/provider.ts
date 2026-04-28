@@ -12,6 +12,10 @@ export class ModelProviderClient {
   private client: OpenAI | null = null;
   private provider: ModelProvider | null = null;
   private rateLimiter: RateLimiter;
+  private completionCache = new Map<string, { content: string; expiresAt: number }>();
+  private cacheHits = 0;
+  private cacheMisses = 0;
+  private retryCount = 0;
 
   constructor() {
     this.rateLimiter = new RateLimiter({
@@ -79,28 +83,57 @@ export class ModelProviderClient {
   ): Promise<string> {
     if (!this.client) throw new Error('Provider not connected');
 
+    // Short-lived cache to avoid duplicate calls from retries/re-entrant flows.
+    const cacheKey = this.buildCompletionCacheKey(messages, modelId, temperature, maxTokens, responseFormat);
+    const cached = this.getCachedCompletion(cacheKey);
+    if (cached) return cached;
+
     // Rate limit the LLM call
     await this.rateLimiter.acquire();
+    const maxRetries = 3;
 
-    try {
-      const completion = await this.client.chat.completions.create({
-        model: modelId,
-        messages: messages.map(m => ({
-          role: m.role as 'system' | 'user' | 'assistant',
-          content: m.content,
-        })),
-        temperature,
-        max_tokens: maxTokens,
-        ...(responseFormat ? { response_format: responseFormat } : {}),
-      });
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const completion = await this.client.chat.completions.create({
+          model: modelId,
+          messages: messages.map(m => ({
+            role: m.role as 'system' | 'user' | 'assistant',
+            content: m.content,
+          })),
+          temperature,
+          max_tokens: maxTokens,
+          ...(responseFormat ? { response_format: responseFormat } : {}),
+        });
 
-      const content = completion.choices[0]?.message?.content;
-      if (!content) throw new Error('Empty response from model');
-      return content;
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : String(error);
-      throw new Error(`Chat completion failed: ${msg}`);
+        const content = completion.choices[0]?.message?.content;
+        if (!content) throw new Error('Empty response from model');
+
+        // Success path: decay adaptive backoff and cache result briefly.
+        this.rateLimiter.decayAdaptiveBackoff();
+        this.setCachedCompletion(cacheKey, content, 120000);
+        return content;
+      } catch (error: unknown) {
+        if (attempt >= maxRetries || !this.isRetryableCompletionError(error)) {
+          const msg = error instanceof Error ? error.message : String(error);
+          throw new Error(`Chat completion failed: ${msg}`);
+        }
+
+        this.retryCount++;
+        const retryAfterMs = this.getRetryAfterMs(error);
+        this.rateLimiter.applyBackoffHint(attempt);
+        if (retryAfterMs > 0) {
+          this.rateLimiter.applyPenalty(retryAfterMs);
+        } else {
+          // Exponential backoff with jitter if provider does not specify retry-after.
+          const backoffMs = Math.min(20000, 1200 * (2 ** attempt) + Math.floor(Math.random() * 500));
+          this.rateLimiter.applyPenalty(backoffMs);
+        }
+
+        await this.rateLimiter.acquire();
+      }
     }
+
+    throw new Error('Chat completion failed after retries');
   }
 
   async testConnection(): Promise<{ success: boolean; message: string; modelCount?: number }> {
@@ -121,12 +154,104 @@ export class ModelProviderClient {
     }
   }
 
-  getRateLimitStats(): { callsInLastMinute: number; callsInLastHour: number } {
-    return this.rateLimiter.getStats();
+  getRateLimitStats(): {
+    callsInLastMinute: number;
+    callsInLastHour: number;
+    minIntervalMs: number;
+    adaptiveMinIntervalMs: number;
+    throttledCount: number;
+    penaltyCount: number;
+    penaltyActive: boolean;
+    retryCount: number;
+    cacheHits: number;
+    cacheMisses: number;
+    cacheSize: number;
+  } {
+    return {
+      ...this.rateLimiter.getStats(),
+      retryCount: this.retryCount,
+      cacheHits: this.cacheHits,
+      cacheMisses: this.cacheMisses,
+      cacheSize: this.completionCache.size,
+    };
   }
 
   updateRateLimitConfig(config: { maxPerMinute?: number; maxPerHour?: number; minIntervalMs?: number }): void {
     this.rateLimiter.updateConfig(config);
+  }
+
+  private buildCompletionCacheKey(
+    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+    modelId: string,
+    temperature: number,
+    maxTokens: number,
+    responseFormat?: { type: 'json_object' | 'text' }
+  ): string {
+    return JSON.stringify({
+      modelId,
+      temperature,
+      maxTokens,
+      responseFormat: responseFormat?.type || 'text',
+      messages,
+    });
+  }
+
+  private getCachedCompletion(cacheKey: string): string | null {
+    const now = Date.now();
+    const hit = this.completionCache.get(cacheKey);
+    if (!hit) {
+      this.cacheMisses++;
+      return null;
+    }
+    if (hit.expiresAt <= now) {
+      this.completionCache.delete(cacheKey);
+      this.cacheMisses++;
+      return null;
+    }
+    this.cacheHits++;
+    return hit.content;
+  }
+
+  private setCachedCompletion(cacheKey: string, content: string, ttlMs: number): void {
+    const expiresAt = Date.now() + ttlMs;
+    this.completionCache.set(cacheKey, { content, expiresAt });
+
+    // Keep cache bounded and remove expired entries opportunistically.
+    if (this.completionCache.size > 500) {
+      const now = Date.now();
+      for (const [k, v] of this.completionCache) {
+        if (v.expiresAt <= now) this.completionCache.delete(k);
+      }
+      if (this.completionCache.size > 500) {
+        const firstKey = this.completionCache.keys().next().value;
+        if (typeof firstKey === 'string') this.completionCache.delete(firstKey);
+      }
+    }
+  }
+
+  private isRetryableCompletionError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    const msg = error.message.toLowerCase();
+    return (
+      msg.includes('429') ||
+      msg.includes('rate limit') ||
+      msg.includes('too many requests') ||
+      msg.includes('503') ||
+      msg.includes('504') ||
+      msg.includes('timeout') ||
+      msg.includes('temporarily unavailable')
+    );
+  }
+
+  private getRetryAfterMs(error: unknown): number {
+    if (!(error instanceof Error)) return 0;
+    const msg = error.message.toLowerCase();
+    // Support patterns like "retry after 2s" or "retry_after=1500ms".
+    const seconds = msg.match(/retry[-_\s]*after[:=\s]+(\d+)\s*s/);
+    if (seconds) return Number(seconds[1]) * 1000;
+    const millis = msg.match(/retry[-_\s]*after[:=\s]+(\d+)\s*ms/);
+    if (millis) return Number(millis[1]);
+    return 0;
   }
 }
 

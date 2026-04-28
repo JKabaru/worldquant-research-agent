@@ -143,9 +143,55 @@ export interface DatabaseStats {
   generationStats: number;
   errorLogs: number;
   feedbackEntries: number;
+  researchTraces: number;
+  memoryNodes: number;
+  memoryEdges: number;
+  retrievalTraces: number;
   researchSessions: number;
   databaseSizeBytes: number;
   walSizeBytes: number;
+}
+
+export interface ResearchTraceRow {
+  id: string;
+  session_id: string;
+  generation: number;
+  candidate_id: string | null;
+  trace_type: string;
+  message: string;
+  payload: string | null;
+  created_at: string;
+}
+
+export interface MemoryNodeRow {
+  id: string;
+  session_id: string;
+  node_type: string;
+  ref_id: string | null;
+  content: string;
+  metadata: string | null;
+  created_at: string;
+}
+
+export interface MemoryEdgeRow {
+  id: string;
+  session_id: string;
+  from_node_id: string;
+  to_node_id: string;
+  edge_type: string;
+  metadata: string | null;
+  created_at: string;
+}
+
+export interface RetrievalTraceRow {
+  id: string;
+  session_id: string;
+  generation: number;
+  model_id: string | null;
+  query_type: string;
+  selected_node_ids: string | null;
+  prompt_budget_tokens: number | null;
+  created_at: string;
 }
 
 // --- Database Class ---
@@ -213,6 +259,10 @@ export class AlphaDatabase {
   private insertGenStatsStmt: Database.Statement | null = null;
   private insertErrorLogStmt: Database.Statement | null = null;
   private insertFeedbackStmt: Database.Statement | null = null;
+  private insertTraceStmt: Database.Statement | null = null;
+  private insertMemoryNodeStmt: Database.Statement | null = null;
+  private insertMemoryEdgeStmt: Database.Statement | null = null;
+  private insertRetrievalTraceStmt: Database.Statement | null = null;
 
   private prepareInsertStatements(): void {
     this.insertFingerprintStmt = this.db.prepare(`
@@ -262,6 +312,30 @@ export class AlphaDatabase {
       INSERT INTO feedback_history
         (id, candidate_id, loop, feedback, action, result, timestamp)
       VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    this.insertTraceStmt = this.db.prepare(`
+      INSERT INTO research_traces
+        (id, session_id, generation, candidate_id, trace_type, message, payload, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    this.insertMemoryNodeStmt = this.db.prepare(`
+      INSERT OR REPLACE INTO memory_nodes
+        (id, session_id, node_type, ref_id, content, metadata, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    this.insertMemoryEdgeStmt = this.db.prepare(`
+      INSERT INTO memory_edges
+        (id, session_id, from_node_id, to_node_id, edge_type, metadata, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    this.insertRetrievalTraceStmt = this.db.prepare(`
+      INSERT INTO retrieval_traces
+        (id, session_id, generation, model_id, query_type, selected_node_ids, prompt_budget_tokens, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
   }
 
@@ -429,6 +503,62 @@ export class AlphaDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_feedback_loop ON feedback_history(loop);
       CREATE INDEX IF NOT EXISTS idx_feedback_candidate ON feedback_history(candidate_id);
+
+      -- Research Trace: transparent lifecycle records for candidate decisions and loop control
+      CREATE TABLE IF NOT EXISTS research_traces (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL DEFAULT '',
+        generation INTEGER NOT NULL DEFAULT 0,
+        candidate_id TEXT,
+        trace_type TEXT NOT NULL DEFAULT '',
+        message TEXT NOT NULL DEFAULT '',
+        payload TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_trace_session ON research_traces(session_id, generation);
+      CREATE INDEX IF NOT EXISTS idx_trace_type ON research_traces(trace_type);
+      CREATE INDEX IF NOT EXISTS idx_trace_candidate ON research_traces(candidate_id);
+
+      -- Memory graph nodes for explicit learning structure
+      CREATE TABLE IF NOT EXISTS memory_nodes (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL DEFAULT '',
+        node_type TEXT NOT NULL DEFAULT '',
+        ref_id TEXT,
+        content TEXT NOT NULL DEFAULT '',
+        metadata TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_nodes_session ON memory_nodes(session_id, node_type);
+      CREATE INDEX IF NOT EXISTS idx_memory_nodes_ref ON memory_nodes(ref_id);
+
+      -- Memory graph edges for causal relationships
+      CREATE TABLE IF NOT EXISTS memory_edges (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL DEFAULT '',
+        from_node_id TEXT NOT NULL,
+        to_node_id TEXT NOT NULL,
+        edge_type TEXT NOT NULL DEFAULT '',
+        metadata TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_edges_session ON memory_edges(session_id, edge_type);
+      CREATE INDEX IF NOT EXISTS idx_memory_edges_from ON memory_edges(from_node_id);
+      CREATE INDEX IF NOT EXISTS idx_memory_edges_to ON memory_edges(to_node_id);
+
+      -- Retrieval traces for prompt transparency
+      CREATE TABLE IF NOT EXISTS retrieval_traces (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL DEFAULT '',
+        generation INTEGER NOT NULL DEFAULT 0,
+        model_id TEXT,
+        query_type TEXT NOT NULL DEFAULT '',
+        selected_node_ids TEXT,
+        prompt_budget_tokens INTEGER,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_retrieval_traces_session ON retrieval_traces(session_id, generation);
 
 
       -- Research Sessions: track complete research runs
@@ -843,6 +973,96 @@ export class AlphaDatabase {
     );
   }
 
+  logTrace(entry: Omit<ResearchTraceRow, 'id' | 'created_at'>): void {
+    this.insertTraceStmt!.run(
+      `trace_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      entry.session_id,
+      entry.generation,
+      entry.candidate_id,
+      entry.trace_type,
+      entry.message,
+      entry.payload,
+      new Date().toISOString(),
+    );
+  }
+
+  getResearchTraces(sessionId: string, limit: number = 200): ResearchTraceRow[] {
+    return this.db.prepare(`
+      SELECT * FROM research_traces
+      WHERE session_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(sessionId, limit) as ResearchTraceRow[];
+  }
+
+  upsertMemoryNode(entry: Omit<MemoryNodeRow, 'created_at'>): void {
+    this.insertMemoryNodeStmt!.run(
+      entry.id,
+      entry.session_id,
+      entry.node_type,
+      entry.ref_id,
+      entry.content,
+      entry.metadata,
+      new Date().toISOString(),
+    );
+  }
+
+  addMemoryEdge(entry: Omit<MemoryEdgeRow, 'id' | 'created_at'>): string {
+    const id = `edge_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this.insertMemoryEdgeStmt!.run(
+      id,
+      entry.session_id,
+      entry.from_node_id,
+      entry.to_node_id,
+      entry.edge_type,
+      entry.metadata,
+      new Date().toISOString(),
+    );
+    return id;
+  }
+
+  addRetrievalTrace(entry: Omit<RetrievalTraceRow, 'id' | 'created_at'>): string {
+    const id = `rtrace_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this.insertRetrievalTraceStmt!.run(
+      id,
+      entry.session_id,
+      entry.generation,
+      entry.model_id,
+      entry.query_type,
+      entry.selected_node_ids,
+      entry.prompt_budget_tokens,
+      new Date().toISOString(),
+    );
+    return id;
+  }
+
+  getMemoryNodes(sessionId: string, limit: number = 200): MemoryNodeRow[] {
+    return this.db.prepare(`
+      SELECT * FROM memory_nodes
+      WHERE session_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(sessionId, limit) as MemoryNodeRow[];
+  }
+
+  getMemoryEdges(sessionId: string, limit: number = 300): MemoryEdgeRow[] {
+    return this.db.prepare(`
+      SELECT * FROM memory_edges
+      WHERE session_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(sessionId, limit) as MemoryEdgeRow[];
+  }
+
+  getRetrievalTraces(sessionId: string, limit: number = 200): RetrievalTraceRow[] {
+    return this.db.prepare(`
+      SELECT * FROM retrieval_traces
+      WHERE session_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(sessionId, limit) as RetrievalTraceRow[];
+  }
+
   getFeedbackHistory(loop?: string, limit = 50): FeedbackRow[] {
     if (loop) {
       return this.db.prepare(
@@ -1073,6 +1293,10 @@ export class AlphaDatabase {
     const generationStats = (db.prepare('SELECT COUNT(*) as c FROM generation_stats').get() as { c: number }).c;
     const errorLogs = (db.prepare('SELECT COUNT(*) as c FROM error_logs').get() as { c: number }).c;
     const feedbackEntries = (db.prepare('SELECT COUNT(*) as c FROM feedback_history').get() as { c: number }).c;
+    const researchTraces = (db.prepare('SELECT COUNT(*) as c FROM research_traces').get() as { c: number }).c;
+    const memoryNodes = (db.prepare('SELECT COUNT(*) as c FROM memory_nodes').get() as { c: number }).c;
+    const memoryEdges = (db.prepare('SELECT COUNT(*) as c FROM memory_edges').get() as { c: number }).c;
+    const retrievalTraces = (db.prepare('SELECT COUNT(*) as c FROM retrieval_traces').get() as { c: number }).c;
     const researchSessions = (db.prepare('SELECT COUNT(*) as c FROM research_sessions').get() as { c: number }).c;
 
     let databaseSizeBytes = 0;
@@ -1098,6 +1322,10 @@ export class AlphaDatabase {
       generationStats,
       errorLogs,
       feedbackEntries,
+      researchTraces,
+      memoryNodes,
+      memoryEdges,
+      retrievalTraces,
       researchSessions,
       databaseSizeBytes,
       walSizeBytes,

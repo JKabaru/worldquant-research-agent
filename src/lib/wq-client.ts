@@ -3,7 +3,17 @@
 // Handles authentication, simulation, alpha management
 // ============================================================
 
-import { WQCredentials, WQSession, WQSimulationRequest, WQSimulationResult, WQAlpha, WQDataField, WQOperator } from './types';
+import {
+  WQCredentials,
+  WQSession,
+  WQSimulationRequest,
+  WQSimulationResult,
+  WQAlpha,
+  WQDataField,
+  WQOperator,
+  WQPerformanceComparison,
+  WQSimulationEnrichment,
+} from './types';
 
 const WQ_BASE_URL = 'https://api.worldquantbrain.com';
 
@@ -15,6 +25,60 @@ interface WQAPISession {
 export class WorldQuantBrainClient {
   private session: WQAPISession | null = null;
   private credentials: WQCredentials | null = null;
+
+  private extractPerformanceComparison(payload: Record<string, unknown>): WQPerformanceComparison {
+    const perf =
+      (payload.performanceComparison as Record<string, unknown>) ||
+      (payload.performance_comparison as Record<string, unknown>) ||
+      (((payload.is as Record<string, unknown>) || {}).performanceComparison as Record<string, unknown>) ||
+      {};
+
+    const toNumber = (v: unknown): number | undefined => typeof v === 'number' ? v : undefined;
+    return {
+      sharpeDiff: toNumber(perf.sharpeDiff ?? perf.sharpe_diff),
+      fitnessDiff: toNumber(perf.fitnessDiff ?? perf.fitness_diff),
+      returnsDiff: toNumber(perf.returnsDiff ?? perf.returns_diff),
+      marginDiff: toNumber(perf.marginDiff ?? perf.margin_diff),
+      drawdownDiff: toNumber(perf.drawdownDiff ?? perf.drawdown_diff),
+      turnoverDiff: toNumber(perf.turnoverDiff ?? perf.turnover_diff),
+      benchmark: typeof (perf.benchmark) === 'string' ? (perf.benchmark as string) : undefined,
+    };
+  }
+
+  private buildEnrichment(
+    alphaPayload: Record<string, unknown>,
+    alphaMetrics: { turnover: number; drawdown: number; margin: number; checks: Array<{ result: 'PASS' | 'FAIL' }> }
+  ): WQSimulationEnrichment {
+    const performanceComparison = this.extractPerformanceComparison(alphaPayload);
+    const totalChecks = alphaMetrics.checks.length || 1;
+    const passChecks = alphaMetrics.checks.filter(c => c.result === 'PASS').length;
+    const checksPassRate = passChecks / totalChecks;
+    const turnoverPenalty = Math.max(0, alphaMetrics.turnover - 0.7);
+    const drawdownPenalty = Math.max(0, alphaMetrics.drawdown - 0.2);
+    const marginBonus = Math.max(0, alphaMetrics.margin / 100);
+
+    const robustnessScore = Math.max(
+      0,
+      1.0
+      + (performanceComparison.sharpeDiff || 0) * 0.25
+      + (performanceComparison.fitnessDiff || 0) * 0.2
+      + marginBonus * 0.1
+      - turnoverPenalty * 0.5
+      - drawdownPenalty * 0.5
+      + checksPassRate * 0.25
+    );
+
+    return {
+      performanceComparison,
+      robustnessScore,
+      qualitySignals: {
+        checksPassRate,
+        turnoverPenalty,
+        drawdownPenalty,
+        marginBonus,
+      },
+    };
+  }
 
   // --- Authentication ---
 
@@ -152,6 +216,7 @@ export class WorldQuantBrainClient {
               status: 'COMPLETE',
               alphaId,
               alpha,
+              enrichment: alpha.enrichment,
             };
           }
           return { id: '', status: 'COMPLETE' };
@@ -184,16 +249,31 @@ export class WorldQuantBrainClient {
     const data = await response.json();
     const isData = data.is || {};
 
+    const checks = (isData.checks || []).map((c: Record<string, string>) => ({
+      result: (c.result || 'FAIL') as 'PASS' | 'FAIL',
+      name: c.name || '',
+      description: c.description,
+    }));
+    const turnover = isData.turnover || 0;
+    const drawdown = isData.drawdown || 0;
+    const margin = isData.margin || 0;
+    const enrichment = this.buildEnrichment(data as Record<string, unknown>, {
+      turnover,
+      drawdown,
+      margin,
+      checks,
+    });
+
     return {
       id: data.id,
       code: data.regular?.code || data.code || '',
       dateCreated: data.dateCreated || '',
       sharpe: isData.sharpe || 0,
       fitness: isData.fitness || 0,
-      turnover: isData.turnover || 0,
-      margin: isData.margin || 0,
+      turnover,
+      margin,
       returns: isData.returns || 0,
-      drawdown: isData.drawdown || 0,
+      drawdown,
       longCount: isData.longCount || 0,
       shortCount: isData.shortCount || 0,
       pnl: isData.pnl || 0,
@@ -201,12 +281,10 @@ export class WorldQuantBrainClient {
       maxDrawdown: isData.maxDrawdown || 0,
       winRate: isData.winRate || 0,
       avgReturn: isData.avgReturn || 0,
-      checks: (isData.checks || []).map((c: Record<string, string>) => ({
-        result: (c.result || 'FAIL') as 'PASS' | 'FAIL',
-        name: c.name || '',
-        description: c.description,
-      })),
+      checks,
       correlations: data.correlations || { powerPool: {}, prod: {} },
+      performanceComparison: enrichment.performanceComparison,
+      enrichment,
       settings: data.settings || {},
       isSubmitted: data.status === 'SUBMITTED' || data.status === 'UNSUBMITTED',
       status: data.status || 'ACTIVE',
@@ -245,16 +323,30 @@ export class WorldQuantBrainClient {
       if (data.results && data.results.length > 0) {
         const results = (data.results || []).map((a: Record<string, unknown>) => {
           const isData = (a.is || {}) as Record<string, unknown>;
+          const checks = ((isData.checks || []) as Record<string, string>[]).map((c: Record<string, string>) => ({
+            result: (c.result || 'FAIL') as 'PASS' | 'FAIL',
+            name: c.name || '',
+            description: c.description,
+          }));
+          const turnover = (isData.turnover as number) || 0;
+          const drawdown = (isData.drawdown as number) || 0;
+          const margin = (isData.margin as number) || 0;
+          const enrichment = this.buildEnrichment(a, {
+            turnover,
+            drawdown,
+            margin,
+            checks,
+          });
           return {
             id: a.id as string,
             code: ((a.regular as Record<string, unknown>)?.code || '') as string,
             dateCreated: a.dateCreated as string,
             sharpe: (isData.sharpe as number) || 0,
             fitness: (isData.fitness as number) || 0,
-            turnover: (isData.turnover as number) || 0,
-            margin: (isData.margin as number) || 0,
+            turnover,
+            margin,
             returns: (isData.returns as number) || 0,
-            drawdown: (isData.drawdown as number) || 0,
+            drawdown,
             longCount: (isData.longCount as number) || 0,
             shortCount: (isData.shortCount as number) || 0,
             pnl: (isData.pnl as number) || 0,
@@ -262,12 +354,10 @@ export class WorldQuantBrainClient {
             maxDrawdown: (isData.maxDrawdown as number) || 0,
             winRate: (isData.winRate as number) || 0,
             avgReturn: (isData.avgReturn as number) || 0,
-            checks: ((isData.checks || []) as Record<string, string>[]).map((c: Record<string, string>) => ({
-              result: (c.result || 'FAIL') as 'PASS' | 'FAIL',
-              name: c.name || '',
-              description: c.description,
-            })),
+            checks,
             correlations: (a.correlations || { powerPool: {}, prod: {} }) as Record<string, Record<string, number>>,
+            performanceComparison: enrichment.performanceComparison,
+            enrichment,
             settings: (a.settings || {}) as Record<string, unknown>,
             isSubmitted: a.status === 'SUBMITTED' || a.status === 'UNSUBMITTED',
             status: (a.status || 'ACTIVE') as string,

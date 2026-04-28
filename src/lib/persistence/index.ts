@@ -14,6 +14,10 @@ export type {
   GenerationStatsRow,
   ErrorLogRow,
   FeedbackRow,
+  MemoryNodeRow,
+  MemoryEdgeRow,
+  RetrievalTraceRow,
+  ResearchTraceRow,
   ResearchSessionRow,
   DatabaseStats,
 } from './database';

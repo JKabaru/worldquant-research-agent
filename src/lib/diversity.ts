@@ -78,7 +78,6 @@ export class DiversityManager {
   private maxPerStyle: number;
   // Correlation feedback rolling queue (last 10 rejections, show last 3)
   private correlationFeedbackQueue: Array<{
-    expression: string;
     similarTo: string[];
     similarity: number;
     patternSignature: string;
@@ -92,19 +91,26 @@ export class DiversityManager {
     maxPerCategory?: number;
     maxPerStyle?: number;
   } = {}) {
-    this.maxCorrelation = config.maxCorrelation || 0.65;
+    this.maxCorrelation = config.maxCorrelation || 0.45;
     this.maxPerCategory = config.maxPerCategory || 50;
     this.maxPerStyle = config.maxPerStyle || 30;
+  }
+
+  setMaxCorrelation(threshold: number): void {
+    if (!Number.isFinite(threshold)) return;
+    this.maxCorrelation = Math.min(0.95, Math.max(0.1, threshold));
   }
 
   // --- Alpha Fingerprinting ---
 
   addFingerprint(fingerprint: string, expression: string, category: string, style: StylePremia): void {
+    const structuralFingerprint = this.extractStructuralFingerprint(expression);
     this.fingerprints.set(fingerprint, {
       fingerprint,
       expression,
       category,
       style,
+      structuralFingerprint,
     });
 
     // Update counts
@@ -145,28 +151,34 @@ export class DiversityManager {
   }
 
   private tokenize(expr: string): string[] {
-    // Extract operators and data fields as tokens
+    // Extract operators, data fields and window constants as tokens.
     const tokens: string[] = [];
+    const opNames = new Set<string>();
 
     // Extract operators
     const opRegex = /\b([a-z_]+)\s*\(/g;
     let match;
     while ((match = opRegex.exec(expr)) !== null) {
-      tokens.push(match[1]);
+      const op = match[1].toLowerCase();
+      opNames.add(op);
+      tokens.push(`op:${op}`);
     }
 
-    // Extract data fields (capitalized words not inside function calls)
-    const fieldRegex = /\b([A-Z][a-zA-Z0-9_]+)\b/g;
+    // Extract identifiers used as fields (mostly lowercase FASTEXPR fields).
+    const fieldRegex = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+    const skip = new Set(['true', 'false', 'nan', 'none', 'and', 'or', 'not']);
     while ((match = fieldRegex.exec(expr)) !== null) {
-      if (!match[1].match(/^[A-Z]+$/) || match[1].length > 3) { // Skip USA, GLB, etc
-        tokens.push(match[1].toLowerCase());
-      }
+      const ident = match[1].toLowerCase();
+      if (skip.has(ident)) continue;
+      if (opNames.has(ident)) continue;
+      if (/^\d+$/.test(ident)) continue;
+      tokens.push(`field:${ident}`);
     }
 
     // Extract numeric patterns (lookback windows)
     const numRegex = /,\s*(\d+)\s*[),]/g;
     while ((match = numRegex.exec(expr)) !== null) {
-      tokens.push(`n${match[1]}`);
+      tokens.push(`win:${match[1]}`);
     }
 
     return tokens;
@@ -192,17 +204,20 @@ export class DiversityManager {
       stack.push(op);
     }
 
-    const fieldRegex = /\b([A-Z][a-zA-Z0-9_]+)\b/g;
+    const fieldRegex = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+    const operatorSet = new Set(operators.map(o => o.toLowerCase()));
     while ((match = fieldRegex.exec(expression)) !== null) {
-      if (!match[1].match(/^[A-Z]+$/) || match[1].length > 3) {
-        const field = match[1].toLowerCase();
-        if (!fields.includes(field)) fields.push(field);
-        const currentOp = stack[stack.length - 1];
-        if (currentOp) {
-          if (!fieldTransforms[currentOp]) fieldTransforms[currentOp] = [];
-          if (!fieldTransforms[currentOp].includes(field)) {
-            fieldTransforms[currentOp].push(field);
-          }
+      const token = match[1].toLowerCase();
+      if (operatorSet.has(token)) continue;
+      if (/^\d+$/.test(token)) continue;
+      if (['true', 'false', 'nan', 'none', 'and', 'or', 'not'].includes(token)) continue;
+      const field = token;
+      if (!fields.includes(field)) fields.push(field);
+      const currentOp = stack[stack.length - 1];
+      if (currentOp) {
+        if (!fieldTransforms[currentOp]) fieldTransforms[currentOp] = [];
+        if (!fieldTransforms[currentOp].includes(field)) {
+          fieldTransforms[currentOp].push(field);
         }
       }
     }
@@ -411,6 +426,7 @@ export class DiversityManager {
         expression: alpha.code,
         category: this.classifyCategory(alpha.code),
         style: this.classifyStyle(alpha.code),
+        structuralFingerprint: this.extractStructuralFingerprint(alpha.code),
       });
       this.wqBaselineAlphaIds.add(alpha.id);
     }
@@ -427,19 +443,24 @@ export class DiversityManager {
    } {
      const similarities: Array<{ alphaId: string; similarity: number }> = [];
 
-     for (const [alphaId, fp] of this.fingerprints) {
+    const candidateStructural = this.extractStructuralFingerprint(candidate.expression);
+    for (const [alphaId, fp] of this.fingerprints) {
        // Skip self-matches using fingerprint (not alpha ID)
        if (fp.fingerprint === candidate.fingerprint) continue;
 
-       const similarity = this.computeSemanticSimilarity(candidate.expression, fp.expression);
-       similarities.push({ alphaId, similarity });
+      const semantic = this.computeSemanticSimilarity(candidate.expression, fp.expression);
+      const structural = fp.structuralFingerprint
+        ? this.computeStructuralSimilarity(candidateStructural, fp.structuralFingerprint)
+        : 0;
+      const similarity = Math.min(1, semantic * 0.55 + structural * 0.45);
+      similarities.push({ alphaId, similarity });
      }
 
      similarities.sort((a, b) => b.similarity - a.similarity);
 
      const top3 = similarities.slice(0, 3);
      const maxSimilarity = similarities.length > 0 ? similarities[0].similarity : 0;
-     const accepted = maxSimilarity < this.maxCorrelation;
+    const accepted = maxSimilarity < this.maxCorrelation;
 
      return {
        accepted,
@@ -611,7 +632,6 @@ export class DiversityManager {
     const patternSignature = this.extractPatternSignature(candidate.expression);
 
     this.correlationFeedbackQueue.push({
-      expression: candidate.expression,
       similarTo: result.topMatches.map(m => m.alphaId),
       similarity: result.pcaCoverage,
       patternSignature,

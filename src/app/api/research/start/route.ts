@@ -33,6 +33,13 @@ export async function POST(request: Request) {
       enableAutoCorrection: body.enableAutoCorrection !== false,
       enableDiversityManagement: body.enableDiversityManagement !== false,
       stylePremiaRotation: body.stylePremiaRotation !== false,
+      freeTierMode: body.freeTierMode === true,
+      strictCorrelationThreshold: typeof body.strictCorrelationThreshold === 'number'
+        ? body.strictCorrelationThreshold
+        : undefined,
+      generationMultiplier: typeof body.generationMultiplier === 'number'
+        ? body.generationMultiplier
+        : undefined,
     };
 
     engine.configure(config);

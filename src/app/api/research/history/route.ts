@@ -12,6 +12,7 @@ export async function GET() {
       errorLog: state.errorLog.slice(-50),
       experienceBuffer: state.experienceBuffer.slice(-20),
       generationStats: state.generationStats.slice(-20),
+      researchTrace: engine.getRecentTraces(200),
       lineageTree: state.lineageTree,
       totalSimulations: state.totalSimulations,
       successfulAlphas: state.successfulAlphas,

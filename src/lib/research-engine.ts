@@ -8,7 +8,7 @@ import {
   ResearchConfig, ResearchState, AlphaCandidate, SimulationRecord,
   ResearchError, FeedbackRecord, ExperienceTuple, LineageNode,
   GenerationStats, WQAlpha, WQSimulationResult, LossComponents,
-  InnerLoopResult, MiddleLoopResult, OuterLoopResult, StylePremia, MacroRegime,
+  InnerLoopResult, MiddleLoopResult, OuterLoopResult, StylePremia, MacroRegime, RewardBreakdown,
 } from './types';
 import { getProviderClient } from './provider';
 import { getWQClient } from './wq-client';
@@ -21,6 +21,7 @@ import {
 import { getDatabase, type DatabaseStats } from './persistence/database';
 import { getDataWarehouse } from './persistence/data-warehouse';
 import { eventBridge } from './event-bridge';
+import { formatSourceContextForPrompt, getConfiguredSourcePaths } from './source-memory';
 
 export type ResearchEventCallback = (event: {
   type: 'status' | 'alpha_generated' | 'simulation_submitted' | 'simulation_complete' |
@@ -43,6 +44,19 @@ export class ResearchEngine {
   // Gap 7: Tracks acceptance metrics (sharpe, fitness) when an alpha is first accepted,
   // used by monitorAlphaHealth() to detect degradation.
   private acceptanceMetrics: Map<string, { sharpe: number; fitness: number }> = new Map();
+  // Reward history by generation for quality progression tracking.
+  private rewardHistory: Array<{ generation: number; candidateId: string; reward: RewardBreakdown }> = [];
+  private memoryNodeByCandidate: Map<string, string> = new Map();
+  private traceBuffer: Array<{
+    id: string;
+    sessionId: string;
+    generation: number;
+    candidateId: string | null;
+    traceType: string;
+    message: string;
+    payload?: Record<string, unknown>;
+    timestamp: string;
+  }> = [];
 
   constructor() {
     this.validator = new AlphaValidator();
@@ -169,6 +183,85 @@ export class ResearchEngine {
     eventBridge.emit(event.type, event);
   }
 
+  private logTrace(
+    traceType: string,
+    message: string,
+    candidateId: string | null = null,
+    payload?: Record<string, unknown>
+  ): void {
+    const entry = {
+      id: uuidv4(),
+      sessionId: this.state.id,
+      generation: this.state.currentGeneration,
+      candidateId,
+      traceType,
+      message,
+      payload,
+      timestamp: new Date().toISOString(),
+    };
+    this.traceBuffer.push(entry);
+    if (this.traceBuffer.length > 5000) this.traceBuffer = this.traceBuffer.slice(-2000);
+    if (this.dbInitialized) {
+      try {
+        getDatabase().logTrace({
+          session_id: entry.sessionId,
+          generation: entry.generation,
+          candidate_id: entry.candidateId,
+          trace_type: entry.traceType,
+          message: entry.message,
+          payload: entry.payload ? JSON.stringify(entry.payload) : null,
+        });
+      } catch { /* non-fatal */ }
+    }
+  }
+
+  private upsertMemoryNode(
+    nodeId: string,
+    nodeType: string,
+    content: string,
+    refId: string | null = null,
+    metadata?: Record<string, unknown>
+  ): void {
+    if (!this.dbInitialized) return;
+    try {
+      getDatabase().upsertMemoryNode({
+        id: nodeId,
+        session_id: this.state.id,
+        node_type: nodeType,
+        ref_id: refId,
+        content,
+        metadata: metadata ? JSON.stringify(metadata) : null,
+      });
+    } catch { /* non-fatal */ }
+  }
+
+  private addMemoryEdge(fromNodeId: string, toNodeId: string, edgeType: string, metadata?: Record<string, unknown>): void {
+    if (!this.dbInitialized) return;
+    try {
+      getDatabase().addMemoryEdge({
+        session_id: this.state.id,
+        from_node_id: fromNodeId,
+        to_node_id: toNodeId,
+        edge_type: edgeType,
+        metadata: metadata ? JSON.stringify(metadata) : null,
+      });
+    } catch { /* non-fatal */ }
+  }
+
+  private addRetrievalTrace(queryType: string, selectedNodeIds: string[], promptBudgetTokens: number): void {
+    if (!this.dbInitialized) return;
+    try {
+      getDatabase().addRetrievalTrace({
+        session_id: this.state.id,
+        generation: this.state.currentGeneration,
+        model_id: this.state.config?.modelId || null,
+        query_type: queryType,
+        selected_node_ids: JSON.stringify(selectedNodeIds),
+        prompt_budget_tokens: promptBudgetTokens,
+      });
+    } catch { /* non-fatal */ }
+  }
+
   getState(): ResearchState {
     return { ...this.state };
   }
@@ -177,14 +270,38 @@ export class ResearchEngine {
     return this.state.status;
   }
 
+  getRecentTraces(limit: number = 200): Array<{
+    id: string;
+    sessionId: string;
+    generation: number;
+    candidateId: string | null;
+    traceType: string;
+    message: string;
+    payload?: Record<string, unknown>;
+    timestamp: string;
+  }> {
+    return this.traceBuffer.slice(-Math.max(1, limit));
+  }
+
   // --- Configuration ---
 
   configure(config: ResearchConfig): void {
-    this.state.config = config;
+    const normalizedConfig: ResearchConfig = { ...config };
+    if (normalizedConfig.freeTierMode) {
+      normalizedConfig.populationSize = Math.min(normalizedConfig.populationSize || 5, 4);
+      normalizedConfig.maxConcurrentSimulations = Math.min(normalizedConfig.maxConcurrentSimulations || 3, 2);
+      normalizedConfig.maxDailySimulations = Math.min(normalizedConfig.maxDailySimulations || 100, 60);
+    }
+    this.state.config = normalizedConfig;
     this.state.id = uuidv4();
     this.state.errorLog = [];
     this.state.feedbackHistory = [];
     this.state.generationStats = [];
+    this.traceBuffer = [];
+    this.memoryNodeByCandidate.clear();
+    if (typeof normalizedConfig.strictCorrelationThreshold === 'number') {
+      this.diversityManager.setMaxCorrelation(normalizedConfig.strictCorrelationThreshold);
+    }
   }
 
   // --- Start Research ---
@@ -406,6 +523,8 @@ export class ResearchEngine {
       let genSharpeSum = 0;
       let genFitnessSum = 0;
       let genBestSharpe = 0;
+      let genRewardSum = 0;
+      let genBestReward = Number.NEGATIVE_INFINITY;
 
       this.emit({
         type: 'status',
@@ -414,6 +533,9 @@ export class ResearchEngine {
           generation: this.state.currentGeneration,
           message: `Starting generation ${this.state.currentGeneration}`,
         },
+      });
+      this.logTrace('generation_start', `Starting generation ${this.state.currentGeneration}`, null, {
+        generation: this.state.currentGeneration,
       });
 
       // Gap 7: Monitor living alpha health at start of each generation
@@ -436,21 +558,66 @@ export class ResearchEngine {
        // Outer Loop: Strategy selection and style rotation
        const outerResult = this.executeOuterLoop();
 
-      // Generate candidates for this generation
-      const batchSize = Math.min(config.populationSize || 5, 10);
-      const candidates = await this.generateCandidates(batchSize, outerResult);
+      // Quality-gated generation: generate many -> rank -> simulate few
+      const simulationTarget = Math.min(config.populationSize || 5, 10);
+      const generationMultiplier = Math.min(
+        8,
+        Math.max(1, config.generationMultiplier || (config.freeTierMode ? 3 : 4))
+      );
+      const rawBatchSize = Math.min(
+        Math.max((config.populationSize || 5) * generationMultiplier, simulationTarget),
+        40
+      );
+      const rawCandidates = await this.generateCandidates(rawBatchSize, outerResult);
+      for (const c of rawCandidates) {
+        const nodeId = `candidate_${c.id}`;
+        this.memoryNodeByCandidate.set(c.id, nodeId);
+        this.upsertMemoryNode(nodeId, 'expression', this.diversityManager.extractPatternSignature(c.expression), c.id, {
+          strategy: c.strategy,
+          generation: c.generation,
+        });
+      }
+      const candidates = this.rankCandidatesForSimulation(rawCandidates, outerResult, simulationTarget);
+      this.emit({
+        type: 'status',
+        data: {
+          message: `Quality ranker: generated ${rawCandidates.length}, shortlisted ${candidates.length}, target simulations ${simulationTarget}`,
+          generation: this.state.currentGeneration,
+        },
+      });
+      this.logTrace('quality_shortlist', 'Quality ranker shortlisted candidates', null, {
+        generated: rawCandidates.length,
+        shortlisted: candidates.length,
+        simulationTarget,
+      });
+      this.addRetrievalTrace('quality_rank_shortlist', candidates.map(c => `candidate_${c.id}`), 400);
 
       // Gap 9: Concurrent simulation batch processing
       // Filter candidates through validation + diversity first, then batch simulate
       const validCandidates: AlphaCandidate[] = [];
       for (const candidate of candidates) {
         if (this.abortController?.signal.aborted || this.state.status !== 'running') break;
+        if (validCandidates.length >= simulationTarget) break;
         genTotal++;
 
         // Inner Loop: Validate expression
         const validationResult = this.executeInnerLoop(candidate);
         if (!validationResult.isValid) {
           this.handleValidationFailure(candidate, validationResult);
+          this.logTrace('validation_failed', 'Inner-loop validation failed', candidate.id, {
+            errors: validationResult.errors,
+          });
+          const candidateNode = this.memoryNodeByCandidate.get(candidate.id);
+          if (candidateNode) {
+            const errorNode = `validation_${candidate.id}_${Date.now()}`;
+            this.upsertMemoryNode(errorNode, 'validation_error', validationResult.errors.join('; '), candidate.id, {
+              generation: this.state.currentGeneration,
+            });
+            this.addMemoryEdge(candidateNode, errorNode, 'failed_with');
+          }
+          const reward = this.computeRewardFromFailure(candidate, 'syntax_failure');
+          genRewardSum += reward.totalReward;
+          genBestReward = Math.max(genBestReward, reward.totalReward);
           continue;
         }
 
@@ -462,6 +629,21 @@ export class ResearchEngine {
             data: { candidateId: candidate.id, accepted: false, reasons: basicDiversity.reasons },
           });
           this.state.candidateQueue.push({ ...candidate, status: 'discarded' });
+          this.logTrace('diversity_rejected', 'Candidate rejected by base diversity', candidate.id, {
+            reasons: basicDiversity.reasons,
+          });
+          const candidateNode = this.memoryNodeByCandidate.get(candidate.id);
+          if (candidateNode) {
+            const rejectNode = `diversity_${candidate.id}_${Date.now()}`;
+            this.upsertMemoryNode(rejectNode, 'correlation_rejection', basicDiversity.reasons.join('; '), candidate.id, {
+              generation: this.state.currentGeneration,
+              layer: 'base',
+            });
+            this.addMemoryEdge(candidateNode, rejectNode, 'rejected_by_diversity');
+          }
+          const reward = this.computeRewardFromFailure(candidate, 'diversity_rejection');
+          genRewardSum += reward.totalReward;
+          genBestReward = Math.max(genBestReward, reward.totalReward);
           continue;
         }
 
@@ -501,9 +683,26 @@ export class ResearchEngine {
             },
           });
           this.state.candidateQueue.push({ ...candidate, status: 'discarded' });
+          this.logTrace('correlation_rejected', 'Candidate rejected by submitted-alpha similarity', candidate.id, {
+            reasons: correlationResult.reasons,
+            pcaCoverage: correlationResult.pcaCoverage,
+            topMatches: correlationResult.topMatches,
+          });
+          const candidateNode = this.memoryNodeByCandidate.get(candidate.id);
+          if (candidateNode) {
+            const rejectNode = `corr_${candidate.id}_${Date.now()}`;
+            this.upsertMemoryNode(rejectNode, 'correlation_rejection', correlationResult.reasons.join('; '), candidate.id, {
+              pcaCoverage: correlationResult.pcaCoverage,
+              topMatches: correlationResult.topMatches,
+            });
+            this.addMemoryEdge(candidateNode, rejectNode, 'rejected_by_correlation');
+          }
 
           // Record correlation rejection for LLM feedback (rolling summary)
           this.diversityManager.recordCorrelationRejection(candidate, correlationResult);
+          const reward = this.computeRewardFromFailure(candidate, 'diversity_rejection');
+          genRewardSum += reward.totalReward;
+          genBestReward = Math.max(genBestReward, reward.totalReward);
           continue;
         }
 
@@ -542,11 +741,45 @@ export class ResearchEngine {
 
           if (!result || result.status === 'FAILED' || result.status === 'ERROR') {
             this.handleSimulationFailure(candidate, result);
+            this.logTrace('simulation_failed', 'Simulation failed or errored', candidate.id, {
+              error: result?.error || 'unknown',
+            });
+            const candidateNode = this.memoryNodeByCandidate.get(candidate.id);
+            if (candidateNode) {
+              const failNode = `simfail_${candidate.id}_${Date.now()}`;
+              this.upsertMemoryNode(failNode, 'simulation_result', result?.error || 'simulation failure', candidate.id, {
+                status: result?.status || 'FAILED',
+              });
+              this.addMemoryEdge(candidateNode, failNode, 'evaluated_as');
+            }
+            const reward = this.computeRewardFromFailure(candidate, 'simulation_failure');
+            genRewardSum += reward.totalReward;
+            genBestReward = Math.max(genBestReward, reward.totalReward);
             continue;
           }
 
           // Middle Loop: Analyze results and potentially polish
           if (result.alpha) {
+            this.logTrace('simulation_complete', 'Simulation completed with alpha metrics', candidate.id, {
+              sharpe: result.alpha.sharpe,
+              fitness: result.alpha.fitness,
+              turnover: result.alpha.turnover,
+              robustnessScore: result.alpha.enrichment?.robustnessScore,
+            });
+            const candidateNode = this.memoryNodeByCandidate.get(candidate.id);
+            if (candidateNode) {
+              const simNode = `sim_${candidate.id}_${Date.now()}`;
+              this.upsertMemoryNode(simNode, 'simulation_result', `Sharpe=${result.alpha.sharpe.toFixed(3)}, Fitness=${result.alpha.fitness.toFixed(3)}`, candidate.id, {
+                sharpe: result.alpha.sharpe,
+                fitness: result.alpha.fitness,
+                turnover: result.alpha.turnover,
+                robustnessScore: result.alpha.enrichment?.robustnessScore,
+              });
+              this.addMemoryEdge(candidateNode, simNode, 'evaluated_as');
+            }
+            const reward = this.computeRewardFromAlpha(candidate, result.alpha);
+            genRewardSum += reward.totalReward;
+            genBestReward = Math.max(genBestReward, reward.totalReward);
             this.executeMiddleLoop(candidate, result.alpha);
             genSuccessful++;
             genSharpeSum += result.alpha.sharpe;
@@ -572,6 +805,8 @@ export class ResearchEngine {
         bestSharpe: genBestSharpe,
         discoveryRate: genTotal > 0 ? genSuccessful / genTotal : 0,
         diversityScore: this.diversityManager.getMetrics().averagePairwiseCorrelation,
+        averageReward: genTotal > 0 ? genRewardSum / genTotal : 0,
+        bestReward: Number.isFinite(genBestReward) ? genBestReward : 0,
         dominantCategory: this.getDominantCategory(),
         timestamp: new Date().toISOString(),
       };
@@ -619,6 +854,13 @@ export class ResearchEngine {
       this.emit({
         type: 'generation_complete',
         data: genStats,
+      });
+      this.logTrace('generation_complete', 'Generation finished', null, {
+        generation: genStats.generation,
+        totalCandidates: genStats.totalCandidates,
+        successful: genStats.successful,
+        averageReward: genStats.averageReward,
+        bestReward: genStats.bestReward,
       });
 
       // Anti-deadlock: check if discovery rate is dropping
@@ -1045,23 +1287,23 @@ Each hypothesis should be 1-2 sentences of plain English.`;
   ): string {
     let prompt = `Generate ${count} unique, creative ${style} investment hypotheses.\n\n`;
 
-    // Context from living alphas for inspiration
+    // Context from living alphas for inspiration (sanitized to avoid expression leakage)
     if (this.state.livingAlphas.length > 0) {
       const recent = this.state.livingAlphas.slice(-3);
       prompt += `## Context: Some ${style} factors that already work:\n`;
       prompt += recent.map(a =>
-        `- Sharpe ${a.sharpe.toFixed(2)}: ${a.code.substring(0, 80)}${a.code.length > 80 ? '...' : ''}`
+        `- Sharpe ${a.sharpe.toFixed(2)}, Fitness ${a.fitness.toFixed(2)}, Turnover ${(a.turnover * 100).toFixed(1)}%`
       ).join('\n');
       prompt += '\n\nGenerate DIFFERENT hypotheses — explore new angles.\n\n';
     }
 
      // Error avoidance context
      const recentErrors = this.state.errorLog
-       .filter(e => e.level === 'error' && e.expression)
+       .filter(e => e.level === 'error')
        .slice(-3);
      if (recentErrors.length > 0) {
        prompt += `## Avoid these failed approaches:\n`;
-       prompt += recentErrors.map(e => `- ${e.message}`).join('\n');
+       prompt += recentErrors.map(e => `- ${e.message}${e.details ? ` (${e.details})` : ''}`).join('\n');
        prompt += '\n\n';
      }
 
@@ -1074,6 +1316,9 @@ Each hypothesis should be 1-2 sentences of plain English.`;
      }
 
      prompt += `Strategy: ${outerResult.strategy} | Mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%\n`;
+     prompt += this.buildSourceGuidanceBlock(
+      `hypothesis generation ${style} ${outerResult.strategy} ${styleConfig.datasets.join(' ')}`
+     );
      prompt += `Generate ${count} diverse, testable investment hypotheses.`;
     return prompt;
   }
@@ -1158,18 +1403,18 @@ Each hypothesis should be 1-2 sentences of plain English.`;
         .slice(0, 5);
       prompt += `## What works (from experience buffer):\n`;
       prompt += topExperiences.map(e =>
-        `- "${e.expression}" -> "${e.modification}" improved metric by ${e.improvement.toFixed(3)}`
+        `- Pattern ${this.diversityManager.extractPatternSignature(e.expression)} with strategy "${e.strategy}" improved metric by ${e.improvement.toFixed(3)}`
       ).join('\n');
       prompt += '\n\n';
     }
 
      // Error feedback
      const recentErrors = this.state.errorLog
-       .filter(e => e.level === 'error' && e.expression)
+       .filter(e => e.level === 'error')
        .slice(-5);
      if (recentErrors.length > 0) {
        prompt += `## Recent errors to AVOID:\n`;
-       prompt += recentErrors.map(e => `- ${e.message}: "${e.expression}"`).join('\n');
+       prompt += recentErrors.map(e => `- ${e.message}${e.details ? ` (${e.details})` : ''}`).join('\n');
        prompt += '\n\n';
      }
 
@@ -1183,6 +1428,9 @@ Each hypothesis should be 1-2 sentences of plain English.`;
 
      prompt += `Translate each hypothesis into a complete FASTEXPR expression. Use ${styleConfig.datasets.join(', ')} data.\n`;
      prompt += `Strategy: ${outerResult.strategy} | Mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%\n`;
+     prompt += this.buildSourceGuidanceBlock(
+      `code translation ${style} ${outerResult.strategy} ${styleConfig.operators.join(' ')} ${hypotheses.join(' ')}`
+     );
      return prompt;
   }
 
@@ -1281,25 +1529,26 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
     }
     prompt += '\n';
 
-    // Include context from successful alphas
+    // Include context from successful alphas without exposing raw submitted expressions
     if (this.state.livingAlphas.length > 0) {
       const examples = this.state.livingAlphas.slice(-3).map(a => ({
-        expression: a.code,
+        signature: this.diversityManager.extractPatternSignature(a.code),
         sharpe: a.sharpe.toFixed(3),
         fitness: a.fitness.toFixed(3),
+        turnover: (a.turnover * 100).toFixed(1) + '%',
       }));
-      prompt += `## Recent successful alphas (for inspiration, DO NOT copy):\n`;
+      prompt += `## Recent successful alpha signatures (for inspiration, DO NOT copy):\n`;
       prompt += JSON.stringify(examples, null, 2);
       prompt += '\n\n';
     }
 
     // Include error feedback from recent failures
     const recentErrors = this.state.errorLog
-      .filter(e => e.level === 'error' && e.expression)
+      .filter(e => e.level === 'error')
       .slice(-5);
     if (recentErrors.length > 0) {
       prompt += `## Recent errors to AVOID:\n`;
-      prompt += recentErrors.map(e => `- ${e.message}: "${e.expression}"`).join('\n');
+      prompt += recentErrors.map(e => `- ${e.message}${e.details ? ` (${e.details})` : ''}`).join('\n');
       prompt += '\n\n';
     }
 
@@ -1324,9 +1573,109 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
      }
 
      prompt += `## Strategy: ${outerResult.strategy} (mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%)\n\n`;
+     prompt += this.buildSourceGuidanceBlock(
+      `expression generation ${style} ${outerResult.strategy} ${styleConfig.datasets.join(' ')} ${styleConfig.operators.join(' ')}`
+     );
      prompt += `Generate ${count} NEW, DIVERSE expressions. Be creative but valid.`;
 
     return prompt;
+  }
+
+  private buildSourceGuidanceBlock(query: string): string {
+    const { promptBlock, selectedIds, estimatedTokens } = formatSourceContextForPrompt(query, 5, 300);
+    this.addRetrievalTrace('source_guidance', selectedIds, estimatedTokens);
+    const sources = getConfiguredSourcePaths();
+    return `\n\n${promptBlock}\nSource files: ${sources.join(' | ')}\n`;
+  }
+
+  // --- Candidate Quality Ranker (Generate many -> rank -> simulate few) ---
+
+  private rankCandidatesForSimulation(
+    candidates: AlphaCandidate[],
+    outerResult: OuterLoopResult,
+    simulationTarget: number
+  ): AlphaCandidate[] {
+    if (candidates.length <= simulationTarget) return candidates;
+
+    const ranked = candidates
+      .map(candidate => {
+        const score = this.computeCandidateQualityScore(candidate, outerResult);
+        return { candidate, score };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    // Keep a buffer above target to survive validation/diversity rejections.
+    const shortlistSize = Math.min(
+      ranked.length,
+      Math.max(simulationTarget * 3, simulationTarget + 4)
+    );
+    return ranked.slice(0, shortlistSize).map(r => r.candidate);
+  }
+
+  private computeCandidateQualityScore(candidate: AlphaCandidate, outerResult: OuterLoopResult): number {
+    const expr = candidate.expression || '';
+    const lower = expr.toLowerCase();
+    const opMatches = expr.match(/\b([a-z_][a-z0-9_]*)\s*\(/g) || [];
+    const opCount = opMatches.length;
+    const uniqueOps = new Set(opMatches.map(o => o.replace(/\s*\($/, '').trim()));
+
+    // Structural quality priors
+    const terminalRankBonus = /(rank|zscore|normalize)\s*\([^)]*\)\s*$/.test(lower) ? 0.25 : 0;
+    const tsPresenceBonus = /ts_[a-z_]+\s*\(/.test(lower) ? 0.2 : 0;
+    const groupPresenceBonus = /group_[a-z_]+\s*\(/.test(lower) ? 0.15 : 0;
+    const balancedComplexity =
+      opCount < 2 ? -0.4 :
+      opCount > 14 ? -0.35 :
+      opCount >= 4 && opCount <= 10 ? 0.3 : 0.1;
+    const diversityOpsBonus = Math.min(0.25, uniqueOps.size * 0.03);
+
+    // Penalize obviously generic/overused simple motifs
+    const genericPenalty =
+      /^rank\s*\(\s*ts_delta\s*\(\s*(close|returns)\s*,\s*\d+\s*\)\s*\)\s*$/i.test(expr) ? 0.45 :
+      /^rank\s*\(\s*(close|returns|volume)\s*\)\s*$/i.test(expr) ? 0.55 :
+      0;
+
+    // Reward priors from historical outcomes (pattern-level, not raw expression reuse)
+    const rewardPrior = this.computePatternRewardPrior(expr);
+
+    // Style coherence bonus
+    const style = outerResult.datasetRotation[0] || 'momentum';
+    const styleLower = style.toLowerCase();
+    const styleCoherence =
+      styleLower === 'momentum' && /ts_delta|ts_returns|ts_rank|trend/.test(lower) ? 0.2 :
+      styleLower === 'value' && /book|earnings|cashflow|debt|assets|revenue/.test(lower) ? 0.2 :
+      styleLower === 'quality' && /earnings|accrual|roic|margin|cashflow/.test(lower) ? 0.2 :
+      styleLower === 'volatility' && /std_dev|kurtosis|skew|volatility/.test(lower) ? 0.2 :
+      0;
+
+    return (
+      terminalRankBonus
+      + tsPresenceBonus
+      + groupPresenceBonus
+      + balancedComplexity
+      + diversityOpsBonus
+      + rewardPrior
+      + styleCoherence
+      - genericPenalty
+    );
+  }
+
+  private computePatternRewardPrior(expression: string): number {
+    if (this.rewardHistory.length === 0) return 0;
+    const signature = this.diversityManager.extractPatternSignature(expression);
+    if (!signature) return 0;
+
+    const related = this.rewardHistory
+      .filter(r => {
+        const candidate = this.state.candidateQueue.find(c => c.id === r.candidateId);
+        if (!candidate) return false;
+        return this.diversityManager.extractPatternSignature(candidate.expression) === signature;
+      })
+      .slice(-20);
+    if (related.length === 0) return 0;
+
+    const avgReward = related.reduce((s, r) => s + r.reward.totalReward, 0) / related.length;
+    return Math.max(-0.5, Math.min(0.5, avgReward * 0.2));
   }
 
   // --- Simulation Management ---
@@ -1584,6 +1933,73 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
     } catch {
       // Silently fail polish attempt
     }
+  }
+
+  // --- Reward System ---
+
+  private recordReward(candidateId: string, reward: RewardBreakdown): void {
+    this.rewardHistory.push({
+      generation: this.state.currentGeneration,
+      candidateId,
+      reward,
+    });
+    if (this.rewardHistory.length > 5000) {
+      this.rewardHistory = this.rewardHistory.slice(-2000);
+    }
+  }
+
+  private computeRewardFromFailure(
+    candidate: AlphaCandidate,
+    reason: 'syntax_failure' | 'diversity_rejection' | 'simulation_failure'
+  ): RewardBreakdown {
+    const base: RewardBreakdown = {
+      noveltyReward: 0,
+      qualityReward: 0,
+      robustnessReward: 0,
+      syntaxPenalty: 0,
+      diversityPenalty: 0,
+      turnoverPenalty: 0,
+      checkFailurePenalty: 0,
+      totalReward: 0,
+    };
+    if (reason === 'syntax_failure') base.syntaxPenalty = 0.8;
+    if (reason === 'diversity_rejection') base.diversityPenalty = 0.6;
+    if (reason === 'simulation_failure') base.checkFailurePenalty = 0.7;
+    base.totalReward =
+      base.noveltyReward + base.qualityReward + base.robustnessReward
+      - base.syntaxPenalty - base.diversityPenalty - base.turnoverPenalty - base.checkFailurePenalty;
+    this.recordReward(candidate.id, base);
+    return base;
+  }
+
+  private computeRewardFromAlpha(candidate: AlphaCandidate, alpha: WQAlpha): RewardBreakdown {
+    const thresholds = ALPHA_QUALITY_THRESHOLDS;
+    const enrichment = alpha.enrichment;
+    const noveltyReward = Math.max(0, 1 - (candidate.diversityScore || 0.5));
+    const qualityReward =
+      Math.max(0, alpha.sharpe / Math.max(0.1, thresholds.targetSharpe))
+      + Math.max(0, alpha.fitness / Math.max(0.1, thresholds.minFitness));
+    const robustnessReward = enrichment?.robustnessScore || 0;
+    const turnoverPenalty = Math.max(0, alpha.turnover - thresholds.maxTurnover);
+    const failedChecks = alpha.checks.filter(c => c.result === 'FAIL').length;
+    const checkFailurePenalty = failedChecks * 0.15;
+    const syntaxPenalty = 0;
+    const diversityPenalty = 0;
+    const totalReward =
+      noveltyReward + qualityReward + robustnessReward
+      - turnoverPenalty - checkFailurePenalty;
+    const reward: RewardBreakdown = {
+      noveltyReward,
+      qualityReward,
+      robustnessReward,
+      syntaxPenalty,
+      diversityPenalty,
+      turnoverPenalty,
+      checkFailurePenalty,
+      totalReward,
+    };
+    this.recordReward(candidate.id, reward);
+    return reward;
   }
 
   // --- Loss Function ---

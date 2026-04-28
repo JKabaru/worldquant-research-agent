@@ -76,6 +76,7 @@ export interface WQSimulationResult {
   error?: string;
   alpha?: WQAlpha;
   retryAfter?: number;
+  enrichment?: WQSimulationEnrichment;
 }
 
 export interface WQAlpha {
@@ -97,9 +98,32 @@ export interface WQAlpha {
   avgReturn: number;
   checks: WQCheck[];
   correlations: WQCorrelations;
+  performanceComparison?: WQPerformanceComparison;
+  enrichment?: WQSimulationEnrichment;
   settings: WQSimulationSettings;
   isSubmitted: boolean;
   status: string;
+}
+
+export interface WQPerformanceComparison {
+  sharpeDiff?: number;
+  fitnessDiff?: number;
+  returnsDiff?: number;
+  marginDiff?: number;
+  drawdownDiff?: number;
+  turnoverDiff?: number;
+  benchmark?: string;
+}
+
+export interface WQSimulationEnrichment {
+  performanceComparison: WQPerformanceComparison;
+  robustnessScore: number;
+  qualitySignals: {
+    checksPassRate: number;
+    turnoverPenalty: number;
+    drawdownPenalty: number;
+    marginBonus: number;
+  };
 }
 
 export interface WQCheck {
@@ -156,6 +180,9 @@ export interface ResearchConfig {
   enableAutoCorrection: boolean;
   enableDiversityManagement: boolean;
   stylePremiaRotation: boolean;
+  freeTierMode?: boolean;
+  strictCorrelationThreshold?: number;
+  generationMultiplier?: number;
 }
 
 export interface ResearchState {
@@ -289,8 +316,21 @@ export interface GenerationStats {
   bestSharpe: number;
   discoveryRate: number;
   diversityScore: number;
+  averageReward?: number;
+  bestReward?: number;
   dominantCategory: string;
   timestamp: string;
+}
+
+export interface RewardBreakdown {
+  noveltyReward: number;
+  qualityReward: number;
+  robustnessReward: number;
+  syntaxPenalty: number;
+  diversityPenalty: number;
+  turnoverPenalty: number;
+  checkFailurePenalty: number;
+  totalReward: number;
 }
 
 // --- Multi-Timescale Feedback Types ---
