@@ -94,16 +94,35 @@ export class ModelProviderClient {
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        const completion = await this.client.chat.completions.create({
-          model: modelId,
-          messages: messages.map(m => ({
-            role: m.role as 'system' | 'user' | 'assistant',
-            content: m.content,
-          })),
-          temperature,
-          max_tokens: maxTokens,
-          ...(responseFormat ? { response_format: responseFormat } : {}),
-        });
+        let completion;
+        try {
+          completion = await this.client.chat.completions.create({
+            model: modelId,
+            messages: messages.map(m => ({
+              role: m.role as 'system' | 'user' | 'assistant',
+              content: m.content,
+            })),
+            temperature,
+            max_tokens: maxTokens,
+            ...(responseFormat ? { response_format: responseFormat } : {}),
+          });
+        } catch (formatErr: unknown) {
+          // Some OpenAI-compatible providers/models reject `response_format`.
+          // Retry once without it so JSON-prompted callers can still proceed.
+          if (responseFormat && this.isUnsupportedResponseFormatError(formatErr)) {
+            completion = await this.client.chat.completions.create({
+              model: modelId,
+              messages: messages.map(m => ({
+                role: m.role as 'system' | 'user' | 'assistant',
+                content: m.content,
+              })),
+              temperature,
+              max_tokens: maxTokens,
+            });
+          } else {
+            throw formatErr;
+          }
+        }
 
         const content = completion.choices[0]?.message?.content;
         if (!content) throw new Error('Empty response from model');
@@ -252,6 +271,19 @@ export class ModelProviderClient {
     const millis = msg.match(/retry[-_\s]*after[:=\s]+(\d+)\s*ms/);
     if (millis) return Number(millis[1]);
     return 0;
+  }
+
+  private isUnsupportedResponseFormatError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    const msg = error.message.toLowerCase();
+    return (
+      msg.includes('response_format') ||
+      msg.includes('response format') ||
+      msg.includes('unsupported') ||
+      msg.includes('not supported') ||
+      msg.includes('invalid param') ||
+      msg.includes('invalid parameter')
+    );
   }
 }
 

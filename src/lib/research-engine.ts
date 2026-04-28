@@ -10,7 +10,7 @@ import {
   GenerationStats, WQAlpha, WQSimulationResult, LossComponents,
   InnerLoopResult, MiddleLoopResult, OuterLoopResult, StylePremia, MacroRegime, RewardBreakdown,
 } from './types';
-import { getProviderClient } from './provider';
+import { getAllProviders, getProvider, getProviderClient } from './provider';
 import { getWQClient } from './wq-client';
 import { AlphaValidator } from './validator';
 import { DiversityManager } from './diversity';
@@ -311,6 +311,7 @@ export class ResearchEngine {
 
     const wqClient = getWQClient();
     if (!wqClient.isAuthenticated()) throw new Error('Not authenticated with WorldQuant BRAIN');
+    this.ensureProviderConnected();
 
     // Ensure persistence is initialized
     await this.initializePersistence();
@@ -1168,7 +1169,11 @@ export class ResearchEngine {
     const provider = getProviderClient();
 
     if (!provider.isConnected()) {
-      throw new Error('Model provider not connected');
+      this.ensureProviderConnected();
+      if (!provider.isConnected()) {
+        this.logError('provider', 'Model provider not connected', undefined, 'No active provider connection available');
+        return [];
+      }
     }
 
     const style = outerResult.datasetRotation[0] || 'momentum';
@@ -2829,6 +2834,24 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
       if (count > max) { max = count; dominant = cat; }
     }
     return dominant;
+  }
+
+  private ensureProviderConnected(): void {
+    const client = getProviderClient();
+    if (client.isConnected()) return;
+
+    const providerId = this.state.config?.providerId;
+    const selectedProvider = providerId ? getProvider(providerId) : undefined;
+    const activeProvider = getAllProviders().find(p => p.isActive);
+    const fallbackProvider = selectedProvider || activeProvider || getAllProviders()[0];
+
+    if (!fallbackProvider) return;
+    try {
+      client.connect(fallbackProvider);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      this.logError('provider', 'Failed to reconnect provider', undefined, msg);
+    }
   }
 }
 
