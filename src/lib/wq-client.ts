@@ -152,7 +152,14 @@ export class WorldQuantBrainClient {
     return this.session !== null;
   }
 
-  async ensureAuthenticated(): Promise<boolean> {
+  async ensureAuthenticated(cookies?: string): Promise<boolean> {
+    if (cookies && !this.session) {
+      this.session = {
+        cookies,
+        headers: {"Content-Type": "application/json", "Accept": "application/json", Cookie: cookies},
+      };
+    }
+
     if (this.session) return true;
     if (!this.credentials) return false;
     try {
@@ -250,7 +257,8 @@ export class WorldQuantBrainClient {
         if (status === 'COMPLETE') {
           const alphaId = data.alpha;
           if (alphaId) {
-            const alpha = await this.getAlpha(alphaId);
+            let alpha = await this.getAlpha(alphaId);
+            alpha = await this.hydrateAlphaCorrelations(alpha);
             return {
               id: progressUrl.split('/').pop() || '',
               status: 'COMPLETE',
@@ -329,6 +337,33 @@ export class WorldQuantBrainClient {
       isSubmitted: data.status === 'SUBMITTED' || data.status === 'UNSUBMITTED',
       status: data.status || 'ACTIVE',
     };
+  }
+
+  private async hydrateAlphaCorrelations(alpha: WQAlpha): Promise<WQAlpha> {
+    const existingCount =
+      Object.keys(alpha.correlations?.powerPool || {}).length +
+      Object.keys(alpha.correlations?.prod || {}).length;
+    if (existingCount > 0) return alpha;
+
+    try {
+      const lookup = await this.listUserAlphas({ limit: 200, order: '-dateCreated' });
+      const matched = lookup.results.find(a => a.id === alpha.id);
+      if (!matched) return alpha;
+
+      const matchedCount =
+        Object.keys(matched.correlations?.powerPool || {}).length +
+        Object.keys(matched.correlations?.prod || {}).length;
+      if (matchedCount > 0) {
+        return {
+          ...alpha,
+          correlations: matched.correlations,
+        };
+      }
+    } catch {
+      // Keep original alpha if hydration fails.
+    }
+
+    return alpha;
   }
 
   async listUserAlphas(params?: {

@@ -332,6 +332,10 @@ export class ResearchEngine {
 
     // Fetch existing alphas for correlation baseline
     await this.loadExistingAlphas();
+    if (!this.diversityManager.hasSubmittedBaseline()) {
+      this.state.status = 'error';
+      throw new Error('Submitted-alpha baseline is required but unavailable; refusing to run to prevent correlation leakage');
+    }
 
     this.emit({ type: 'status', data: { status: 'running', message: 'Research engine started' } });
 
@@ -415,6 +419,10 @@ export class ResearchEngine {
     }
 
     // Continue the research loop from where we left off
+    if (!this.diversityManager.hasSubmittedBaseline()) {
+      this.state.status = 'error';
+      throw new Error('Submitted-alpha baseline missing on resume; refusing to continue');
+    }
     this.runResearchLoop().catch(error => {
       this.state.status = 'error';
       this.logError('outer_loop', 'Research loop crashed after resume', undefined, error instanceof Error ? error.message : String(error));
@@ -995,6 +1003,57 @@ export class ResearchEngine {
     const thresholds = ALPHA_QUALITY_THRESHOLDS;
     const modifications: string[] = [];
 
+    // Hard post-simulation correlation gate: if WQ reports high self-correlation against submitted
+    // alphas, force reject and blacklist the pattern so it cannot be re-generated easily.
+    const hasCorrelationData = this.hasReportedCorrelationData(alpha);
+    if (!hasCorrelationData) {
+      const blacklistedPattern = this.diversityManager.blacklistExpressionPattern(candidate.expression);
+      candidate.status = 'failed';
+      candidate.error = 'Rejected post-simulation: missing correlation payload from platform';
+      this.state.candidateQueue.push(candidate);
+      this.logTrace('correlation_rejected', 'Rejected due to missing platform correlation payload', candidate.id, {
+        blacklistedPattern,
+      });
+      this.addFeedback(
+        'middle',
+        candidate.id,
+        'Post-simulation reject: missing platform correlation payload',
+        'rejected',
+        `Blacklisted pattern: ${blacklistedPattern}`
+      );
+      return result;
+    }
+
+    const maxReportedCorrelation = this.getMaxReportedCorrelation(alpha);
+    const hardCorrelationLimit = this.getHardCorrelationLimit();
+    if (maxReportedCorrelation >= hardCorrelationLimit) {
+      const topMatches = this.getTopCorrelationMatches(alpha);
+      const blacklistedPattern = this.diversityManager.blacklistExpressionPattern(candidate.expression);
+
+      candidate.status = 'failed';
+      candidate.error = `Rejected post-simulation: correlation ${(maxReportedCorrelation * 100).toFixed(1)}% >= ${(hardCorrelationLimit * 100).toFixed(1)}%`;
+      this.state.candidateQueue.push(candidate);
+
+      this.logTrace('correlation_rejected', 'Rejected by post-simulation hard correlation gate', candidate.id, {
+        maxReportedCorrelation,
+        hardCorrelationLimit,
+        topMatches,
+        blacklistedPattern,
+      });
+      this.addFeedback(
+        'middle',
+        candidate.id,
+        `Post-simulation reject: correlation ${(maxReportedCorrelation * 100).toFixed(1)}% >= ${(hardCorrelationLimit * 100).toFixed(1)}%`,
+        'rejected',
+        `Blacklisted pattern: ${blacklistedPattern}`
+      );
+      this.diversityManager.recordCorrelationRejection(candidate, {
+        pcaCoverage: maxReportedCorrelation,
+        topMatches,
+      });
+      return result;
+    }
+
     // Check each metric — standard acceptance criteria
     if (alpha.sharpe >= thresholds.minSharpe && alpha.fitness >= thresholds.minFitness &&
         alpha.turnover <= thresholds.maxTurnover &&
@@ -1055,6 +1114,42 @@ export class ResearchEngine {
     this.addFeedback('middle', candidate.id, modifications.join('; '), 'rejected', modifications.join('; '));
 
     return result;
+  }
+
+  private getHardCorrelationLimit(): number {
+    const configured = this.state.config?.strictCorrelationThreshold;
+    if (typeof configured === 'number' && Number.isFinite(configured)) {
+      return Math.min(0.7, Math.max(0.2, configured));
+    }
+    return 0.35;
+  }
+
+  private getMaxReportedCorrelation(alpha: WQAlpha): number {
+    const powerPool = Object.values(alpha.correlations?.powerPool || {});
+    const prod = Object.values(alpha.correlations?.prod || {});
+    const values = [...powerPool, ...prod]
+      .map(v => Number(v))
+      .filter(v => Number.isFinite(v))
+      .map(v => Math.abs(v));
+    if (values.length === 0) return 0;
+    return Math.max(...values);
+  }
+
+  private hasReportedCorrelationData(alpha: WQAlpha): boolean {
+    const powerCount = Object.keys(alpha.correlations?.powerPool || {}).length;
+    const prodCount = Object.keys(alpha.correlations?.prod || {}).length;
+    return powerCount + prodCount > 0;
+  }
+
+  private getTopCorrelationMatches(alpha: WQAlpha): Array<{ alphaId: string; similarity: number }> {
+    const allEntries = [
+      ...Object.entries(alpha.correlations?.powerPool || {}),
+      ...Object.entries(alpha.correlations?.prod || {}),
+    ]
+      .map(([alphaId, similarity]) => ({ alphaId, similarity: Math.abs(Number(similarity)) }))
+      .filter(item => Number.isFinite(item.similarity))
+      .sort((a, b) => b.similarity - a.similarity);
+    return allEntries.slice(0, 5);
   }
 
   // --- Outer Loop: Evolutionary Strategy & Dataset Rotation ---
@@ -1292,16 +1387,6 @@ Each hypothesis should be 1-2 sentences of plain English.`;
   ): string {
     let prompt = `Generate ${count} unique, creative ${style} investment hypotheses.\n\n`;
 
-    // Context from living alphas for inspiration (sanitized to avoid expression leakage)
-    if (this.state.livingAlphas.length > 0) {
-      const recent = this.state.livingAlphas.slice(-3);
-      prompt += `## Context: Some ${style} factors that already work:\n`;
-      prompt += recent.map(a =>
-        `- Sharpe ${a.sharpe.toFixed(2)}, Fitness ${a.fitness.toFixed(2)}, Turnover ${(a.turnover * 100).toFixed(1)}%`
-      ).join('\n');
-      prompt += '\n\nGenerate DIFFERENT hypotheses — explore new angles.\n\n';
-    }
-
      // Error avoidance context
      const recentErrors = this.state.errorLog
        .filter(e => e.level === 'error')
@@ -1534,18 +1619,8 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
     }
     prompt += '\n';
 
-    // Include context from successful alphas without exposing raw submitted expressions
-    if (this.state.livingAlphas.length > 0) {
-      const examples = this.state.livingAlphas.slice(-3).map(a => ({
-        signature: this.diversityManager.extractPatternSignature(a.code),
-        sharpe: a.sharpe.toFixed(3),
-        fitness: a.fitness.toFixed(3),
-        turnover: (a.turnover * 100).toFixed(1) + '%',
-      }));
-      prompt += `## Recent successful alpha signatures (for inspiration, DO NOT copy):\n`;
-      prompt += JSON.stringify(examples, null, 2);
-      prompt += '\n\n';
-    }
+    // Intentionally do not include any prior alpha signatures in prompts.
+    // This prevents the model from reconstructing submitted-alpha structures.
 
     // Include error feedback from recent failures
     const recentErrors = this.state.errorLog
@@ -1564,7 +1639,7 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
          .slice(0, 5);
        prompt += `## What works (from experience buffer):\n`;
        prompt += topExperiences.map(e =>
-         `- "${e.expression}" -> "${e.modification}" improved metric by ${e.improvement.toFixed(3)}`
+         `- Pattern ${this.diversityManager.extractPatternSignature(e.expression)} improved metric by ${e.improvement.toFixed(3)}`
        ).join('\n');
        prompt += '\n\n';
      }
@@ -2685,24 +2760,9 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
    private async loadExistingAlphas(): Promise<void> {
     try {
       const wqClient = getWQClient();
-      const result = await wqClient.listUserAlphas({
-        limit: 50,
-        minSharpe: 0.5,
-        order: '-is.sharpe',
-      });
-
-      this.state.livingAlphas = result.results;
-
-      // Build diversity baseline from existing alphas
-      for (const alpha of result.results) {
-        const fingerprint = this.validator.generateFingerprint(alpha.code);
-        this.diversityManager.addFingerprint(
-          fingerprint,
-          alpha.code,
-          this.classifyCategory(alpha.code),
-          this.classifyStyle(alpha.code)
-        );
-      }
+      // Keep in-session living library separate from user submitted alphas to avoid
+      // prompt/evolution leakage from production portfolio formulas.
+      this.state.livingAlphas = [];
 
       // Gap 3: Also load submitted alphas specifically for correlation baseline
       const submittedResult = await wqClient.listUserAlphas({
@@ -2715,7 +2775,7 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
 
       this.state.diversityMetrics = this.diversityManager.getMetrics();
     } catch {
-      // Non-fatal: proceed without existing alpha data
+      // Leave baseline empty; caller enforces fail-closed behavior.
     }
   }
 

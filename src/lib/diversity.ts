@@ -85,20 +85,23 @@ export class DiversityManager {
   }> = [];
   // Track WQ baseline alpha IDs for refresh replacement
   private wqBaselineAlphaIds: Set<string> = new Set();
+  private submittedBaselineIds: Set<string> = new Set();
+  // Hard blacklist for expression signatures that slipped through and later proved too correlated.
+  private blacklistedPatternSignatures: Set<string> = new Set();
 
   constructor(config: {
     maxCorrelation?: number;
     maxPerCategory?: number;
     maxPerStyle?: number;
   } = {}) {
-    this.maxCorrelation = config.maxCorrelation || 0.45;
+    this.maxCorrelation = config.maxCorrelation || 0.35;
     this.maxPerCategory = config.maxPerCategory || 50;
     this.maxPerStyle = config.maxPerStyle || 30;
   }
 
   setMaxCorrelation(threshold: number): void {
     if (!Number.isFinite(threshold)) return;
-    this.maxCorrelation = Math.min(0.95, Math.max(0.1, threshold));
+    this.maxCorrelation = Math.min(0.8, Math.max(0.1, threshold));
   }
 
   // --- Alpha Fingerprinting ---
@@ -182,6 +185,47 @@ export class DiversityManager {
     }
 
     return tokens;
+  }
+
+  private jaccardSimilarity<T>(a: Iterable<T>, b: Iterable<T>): number {
+    const setA = new Set(a);
+    const setB = new Set(b);
+    if (setA.size === 0 && setB.size === 0) return 0;
+    const intersection = [...setA].filter(x => setB.has(x)).length;
+    const union = new Set([...setA, ...setB]).size;
+    return union > 0 ? intersection / union : 0;
+  }
+
+  private normalizeExpressionForComparison(expression: string): string {
+    return expression
+      .toLowerCase()
+      .replace(/\s+/g, '')
+      .replace(/\d+(\.\d+)?/g, 'N')
+      .replace(/"[^"]*"/g, '"S"')
+      .replace(/'[^']*'/g, "'S'");
+  }
+
+  private trigramDiceSimilarity(a: string, b: string): number {
+    if (!a || !b) return 0;
+    const grams = (s: string): string[] => {
+      if (s.length < 3) return [s];
+      const out: string[] = [];
+      for (let i = 0; i <= s.length - 3; i++) out.push(s.slice(i, i + 3));
+      return out;
+    };
+    const ga = grams(a);
+    const gb = grams(b);
+    const counts = new Map<string, number>();
+    for (const g of ga) counts.set(g, (counts.get(g) || 0) + 1);
+    let shared = 0;
+    for (const g of gb) {
+      const c = counts.get(g) || 0;
+      if (c > 0) {
+        shared += 1;
+        counts.set(g, c - 1);
+      }
+    }
+    return (2 * shared) / (ga.length + gb.length);
   }
 
   // --- Structural Fingerprint (Phase 1) ---
@@ -379,6 +423,7 @@ export class DiversityManager {
            accepted: false,
            reasons: [
              ...baseResult.reasons,
+             submittedResult.rejectionReason || 'Rejected by strict submitted-alpha similarity guard',
              `Correlated with submitted alphas (avg similarity: ${(submittedResult.averageSimilarity * 100).toFixed(1)}%)`,
            ],
            diversityScore: Math.max(0, 1 - submittedResult.averageSimilarity),
@@ -419,6 +464,7 @@ export class DiversityManager {
       }
       this.wqBaselineAlphaIds.clear();
     }
+    this.submittedBaselineIds.clear();
 
     for (const alpha of alphas) {
       this.fingerprints.set(alpha.id, {
@@ -429,6 +475,7 @@ export class DiversityManager {
         structuralFingerprint: this.extractStructuralFingerprint(alpha.code),
       });
       this.wqBaselineAlphaIds.add(alpha.id);
+      this.submittedBaselineIds.add(alpha.id);
     }
   }
 
@@ -440,11 +487,28 @@ export class DiversityManager {
      accepted: boolean;
      averageSimilarity: number;
      topMatches: Array<{ alphaId: string; similarity: number }>;
+     rejectionReason?: string;
    } {
      const similarities: Array<{ alphaId: string; similarity: number }> = [];
+     let hardNearDuplicate = false;
+     let hardReason = '';
+
+    // Fail closed: if submitted baseline is unavailable, block candidate rather than
+    // allowing potential near-duplicate leakage to pass.
+    if (this.submittedBaselineIds.size === 0) {
+      return {
+        accepted: false,
+        averageSimilarity: 1,
+        topMatches: [],
+        rejectionReason: 'Submitted-alpha baseline unavailable; refusing to simulate without correlation reference set',
+      };
+    }
 
     const candidateStructural = this.extractStructuralFingerprint(candidate.expression);
-    for (const [alphaId, fp] of this.fingerprints) {
+    const normalizedCandidate = this.normalizeExpressionForComparison(candidate.expression);
+    for (const alphaId of this.submittedBaselineIds) {
+      const fp = this.fingerprints.get(alphaId);
+      if (!fp) continue;
        // Skip self-matches using fingerprint (not alpha ID)
        if (fp.fingerprint === candidate.fingerprint) continue;
 
@@ -452,20 +516,47 @@ export class DiversityManager {
       const structural = fp.structuralFingerprint
         ? this.computeStructuralSimilarity(candidateStructural, fp.structuralFingerprint)
         : 0;
-      const similarity = Math.min(1, semantic * 0.55 + structural * 0.45);
+      const candidateOps = candidateStructural.operators;
+      const baselineOps = fp.structuralFingerprint?.operators || [];
+      const candidateFields = candidateStructural.fields;
+      const baselineFields = fp.structuralFingerprint?.fields || [];
+      const operatorOverlap = this.jaccardSimilarity(candidateOps, baselineOps);
+      const fieldOverlap = this.jaccardSimilarity(candidateFields, baselineFields);
+
+      const normalizedBaseline = this.normalizeExpressionForComparison(fp.expression);
+      const normalizedSimilarity = this.trigramDiceSimilarity(normalizedCandidate, normalizedBaseline);
+
+      const similarity = Math.min(
+        1,
+        semantic * 0.4 +
+        structural * 0.3 +
+        operatorOverlap * 0.15 +
+        fieldOverlap * 0.15
+      );
       similarities.push({ alphaId, similarity });
+
+      // Hard near-duplicate gates for strict rejection.
+      if (
+        (semantic >= 0.72 && structural >= 0.72) ||
+        (operatorOverlap >= 0.70 && fieldOverlap >= 0.85) ||
+        normalizedSimilarity >= 0.82
+      ) {
+        hardNearDuplicate = true;
+        hardReason = `Near-duplicate detected vs submitted alpha ${alphaId.slice(0, 8)} (semantic=${(semantic * 100).toFixed(0)}%, structural=${(structural * 100).toFixed(0)}%, normalized=${(normalizedSimilarity * 100).toFixed(0)}%)`;
+      }
      }
 
      similarities.sort((a, b) => b.similarity - a.similarity);
 
      const top3 = similarities.slice(0, 3);
      const maxSimilarity = similarities.length > 0 ? similarities[0].similarity : 0;
-    const accepted = maxSimilarity < this.maxCorrelation;
+    const accepted = !hardNearDuplicate && maxSimilarity < this.maxCorrelation;
 
      return {
        accepted,
        averageSimilarity: maxSimilarity,
        topMatches: top3.slice(0, 5),
+       rejectionReason: accepted ? undefined : (hardReason || `Similarity gate exceeded (${(maxSimilarity * 100).toFixed(1)}% >= ${(this.maxCorrelation * 100).toFixed(1)}%)`),
      };
    }
 
@@ -507,6 +598,13 @@ export class DiversityManager {
   } {
     const reasons: string[] = [];
     let score = 1.0;
+
+    // Hard blacklist check for previously rejected near-duplicate signatures.
+    const patternSignature = this.extractPatternSignature(candidate.expression);
+    if (this.blacklistedPatternSignatures.has(patternSignature)) {
+      reasons.push('Pattern signature is blacklisted due to prior high-correlation rejection');
+      score -= 0.8;
+    }
 
     // Check fingerprint duplicate
     if (this.isDuplicate(candidate.fingerprint)) {
@@ -699,6 +797,18 @@ export class DiversityManager {
     return `\n## Recent Correlation Rejections (avoid these operator+field patterns):\n${lines.join('\n')}`;
   }
 
+  blacklistExpressionPattern(expression: string): string {
+    const signature = this.extractPatternSignature(expression);
+    if (signature) {
+      this.blacklistedPatternSignatures.add(signature);
+    }
+    return signature;
+  }
+
+  hasSubmittedBaseline(): boolean {
+    return this.submittedBaselineIds.size > 0;
+  }
+
   // --- Pairwise Correlation Matrix for Living Alphas ---
 
   computePairwiseCorrelations(alphas: WQAlpha[]): Map<string, Map<string, number>> {
@@ -728,5 +838,6 @@ export class DiversityManager {
     this.styleCounts.clear();
     this.correlationFeedbackQueue = [];
     this.wqBaselineAlphaIds.clear();
+    this.blacklistedPatternSignatures.clear();
   }
 }
