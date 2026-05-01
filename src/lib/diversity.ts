@@ -78,11 +78,13 @@ export class DiversityManager {
   private maxPerStyle: number;
   // Correlation feedback rolling queue (last 10 rejections, show last 3)
   private correlationFeedbackQueue: Array<{
-    similarTo: string[];
+    behavioralCategory: string;
+    failureReason: string;
     similarity: number;
-    patternSignature: string;
     timestamp: number;
   }> = [];
+  private clusterCounter = 0;
+  private alphaToCluster: Map<string, string> = new Map();
   // Track WQ baseline alpha IDs for refresh replacement
   private wqBaselineAlphaIds: Set<string> = new Set();
   private submittedBaselineIds: Set<string> = new Set();
@@ -356,21 +358,25 @@ export class DiversityManager {
   }
 
   computePCACoverage(newReturns: number[]): number {
-    // Simple PCA coverage: check how much of new returns are explained by existing principal components
     const existingReturnArrays = Array.from(this.alphaReturns.values());
-    if (existingReturnArrays.length < 3) return 1.0; // Not enough data, accept
+    if (existingReturnArrays.length < 3) return 1.0;
 
-    // Compute correlation with existing alphas
-    const correlations = existingReturnArrays.map(existing => {
-      return this.computeCorrelation(newReturns, existing);
+    const multiMetrics = existingReturnArrays.map(existing => {
+      return this.computeMultiMetricCorrelation(newReturns, existing);
     });
 
-    // If top 3 correlations are too high, reject
-    const sortedCorrs = correlations.sort((a, b) => Math.abs(b) - Math.abs(a));
-    const top3AvgCorr = sortedCorrs.slice(0, 3).reduce((s, c) => s + Math.abs(c), 0) / Math.min(3, sortedCorrs.length);
+    const combinedScores = multiMetrics.map(m => {
+      const combined = (Math.abs(m.pearson) * 0.3) +
+        (Math.abs(m.spearman) * 0.3) +
+        (m.maxRolling * 0.25) +
+        (m.avgRolling * 0.15);
+      return combined * (0.5 + m.stability * 0.5);
+    });
 
-    // Higher coverage = more explained by existing = less diverse
-    return Math.min(1.0, top3AvgCorr);
+    combinedScores.sort((a, b) => b - a);
+    const top3Avg = combinedScores.slice(0, 3).reduce((s, c) => s + c, 0) / Math.min(3, combinedScores.length);
+
+    return Math.min(1.0, top3Avg);
   }
 
   isCorrelatedWithPortfolio(newReturns: number[], threshold?: number): boolean {
@@ -398,6 +404,75 @@ export class DiversityManager {
     return denom > 0 ? covAB / denom : 0;
   }
 
+  private computeSpearmanCorrelation(a: number[], b: number[]): number {
+    if (a.length !== b.length || a.length < 4) return 0;
+
+    const rank = (arr: number[]): number[] => {
+      const sorted = arr.map((v, i) => ({ v, i })).sort((x, y) => x.v - y.v);
+      const ranks = new Array(arr.length);
+      for (let i = 0; i < sorted.length; ) {
+        let j = i;
+        while (j < sorted.length && sorted[j].v === sorted[i].v) j++;
+        const r = (i + j + 1) / 2;
+        for (let k = i; k < j; k++) ranks[sorted[k].i] = r;
+        i = j;
+      }
+      return ranks;
+    };
+
+    const rankA = rank(a);
+    const rankB = rank(b);
+    return this.computeCorrelation(rankA, rankB);
+  }
+
+  private computeRollingCorrelation(a: number[], b: number[], windowSize: number = 30): number[] {
+    if (a.length !== b.length || a.length < windowSize * 2) return [0];
+
+    const correlations: number[] = [];
+    for (let i = 0; i <= a.length - windowSize; i++) {
+      const sliceA = a.slice(i, i + windowSize);
+      const sliceB = b.slice(i, i + windowSize);
+      correlations.push(this.computeCorrelation(sliceA, sliceB));
+    }
+    return correlations;
+  }
+
+  private computeMultiMetricCorrelation(a: number[], b: number[]): {
+    pearson: number;
+    spearman: number;
+    maxRolling: number;
+    avgRolling: number;
+    stability: number;
+  } {
+    const pearson = this.computeCorrelation(a, b);
+    const spearman = this.computeSpearmanCorrelation(a, b);
+    const rolling = this.computeRollingCorrelation(a, b, Math.min(30, Math.floor(a.length / 3)));
+
+    const maxRolling = rolling.length > 0 ? Math.max(...rolling.map(r => Math.abs(r))) : 0;
+    const avgRolling = rolling.length > 0 ? rolling.reduce((s, r) => s + Math.abs(r), 0) / rolling.length : 0;
+
+    let stability = 1;
+    if (rolling.length > 1) {
+      const mean = avgRolling;
+      const variance = rolling.reduce((s, r) => s + Math.pow(Math.abs(r) - mean, 2), 0) / rolling.length;
+      const std = Math.sqrt(variance);
+      stability = Math.max(0, Math.min(1, 1 - std / (Math.abs(mean) + 0.001)));
+    }
+
+    return { pearson, spearman, maxRolling, avgRolling, stability };
+  }
+
+  computeAdaptiveThreshold(): number {
+    const totalFingerprints = this.fingerprints.size;
+    const portfolioDiversity = this.computeAggregateCoverage();
+
+    const baseThreshold = this.maxCorrelation;
+    const diversityBonus = Math.min(0.15, (totalFingerprints / 100) * 0.05);
+    const penalty = portfolioDiversity > 0.5 ? 0.05 : 0;
+
+    return Math.max(0.25, Math.min(0.5, baseThreshold - penalty + diversityBonus));
+  }
+
   /**
    * PCA-based Pre-Simulation Correlation Prediction.
    * Now uses in-memory Jaccard similarity against submitted WQ alphas
@@ -409,13 +484,11 @@ export class DiversityManager {
      diversityScore: number;
      pcaCoverage: number;
      pcaRecommendation: string;
-     topMatches: Array<{ alphaId: string; similarity: number }>; // for feedback
+     topMatches: Array<{ clusterId: string; similarity: number }>;
    }> {
-     // First run the in-memory diversity check
      const baseResult = this.evaluateCandidate(candidate);
 
      if (baseResult.accepted) {
-       // Now run submitted-alpha correlation check
        const submittedResult = this.evaluateCandidateWithSubmittedAlphas(candidate);
        if (!submittedResult.accepted) {
          return {
@@ -423,12 +496,12 @@ export class DiversityManager {
            accepted: false,
            reasons: [
              ...baseResult.reasons,
-             submittedResult.rejectionReason || 'Rejected by strict submitted-alpha similarity guard',
-             `Correlated with submitted alphas (avg similarity: ${(submittedResult.averageSimilarity * 100).toFixed(1)}%)`,
+             submittedResult.rejectionReason || 'Rejected by submitted-alpha similarity guard',
+             `Correlated with existing portfolio patterns (avg: ${(submittedResult.averageSimilarity * 100).toFixed(1)}%)`,
            ],
            diversityScore: Math.max(0, 1 - submittedResult.averageSimilarity),
            pcaCoverage: submittedResult.averageSimilarity,
-           pcaRecommendation: `Top matches: ${submittedResult.topMatches.map(m => `${m.alphaId.slice(0, 8)} (${(m.similarity * 100).toFixed(0)}%)`).join(', ')}`,
+           pcaRecommendation: `Similar to ${submittedResult.topMatches.map(m => `${m.clusterId} (${(m.similarity * 100).toFixed(0)}%)`).join(', ')}`,
            topMatches: submittedResult.topMatches,
          };
        }
@@ -436,7 +509,7 @@ export class DiversityManager {
        return {
          ...baseResult,
          pcaCoverage: submittedResult.averageSimilarity,
-         pcaRecommendation: `Low correlation with submitted alphas (avg: ${(submittedResult.averageSimilarity * 100).toFixed(1)}%)`,
+         pcaRecommendation: `Low correlation with portfolio (avg: ${(submittedResult.averageSimilarity * 100).toFixed(1)}%)`,
          topMatches: submittedResult.topMatches,
        };
      }
@@ -479,84 +552,99 @@ export class DiversityManager {
     }
   }
 
-  /**
-   * Evaluate a candidate against the loaded submitted alphas using
-   * Jaccard token similarity (simple operator/field overlap).
-   */
+/**
+    * Evaluate a candidate against the loaded submitted alphas using
+    * Jaccard token similarity (simple operator/field overlap).
+    * Uses cluster IDs to anonymize topMatches - no alpha IDs exposed.
+    */
    evaluateCandidateWithSubmittedAlphas(candidate: AlphaCandidate): {
      accepted: boolean;
      averageSimilarity: number;
-     topMatches: Array<{ alphaId: string; similarity: number }>;
+     topMatches: Array<{ clusterId: string; similarity: number }>;
      rejectionReason?: string;
    } {
-     const similarities: Array<{ alphaId: string; similarity: number }> = [];
+     const similarities: Array<{ alphaId: string; clusterId: string; similarity: number }> = [];
      let hardNearDuplicate = false;
-     let hardReason = '';
+     let hardReasonType = '';
 
-    // Fail closed: if submitted baseline is unavailable, block candidate rather than
-    // allowing potential near-duplicate leakage to pass.
-    if (this.submittedBaselineIds.size === 0) {
-      return {
-        accepted: false,
-        averageSimilarity: 1,
-        topMatches: [],
-        rejectionReason: 'Submitted-alpha baseline unavailable; refusing to simulate without correlation reference set',
-      };
-    }
+     if (this.submittedBaselineIds.size === 0) {
+       return {
+         accepted: false,
+         averageSimilarity: 1,
+         topMatches: [],
+         rejectionReason: 'Submitted-alpha baseline unavailable; refusing to simulate without correlation reference set',
+       };
+     }
 
-    const candidateStructural = this.extractStructuralFingerprint(candidate.expression);
-    const normalizedCandidate = this.normalizeExpressionForComparison(candidate.expression);
-    for (const alphaId of this.submittedBaselineIds) {
-      const fp = this.fingerprints.get(alphaId);
-      if (!fp) continue;
-       // Skip self-matches using fingerprint (not alpha ID)
+     const candidateStructural = this.extractStructuralFingerprint(candidate.expression);
+     const normalizedCandidate = this.normalizeExpressionForComparison(candidate.expression);
+     for (const alphaId of this.submittedBaselineIds) {
+       const fp = this.fingerprints.get(alphaId);
+       if (!fp) continue;
        if (fp.fingerprint === candidate.fingerprint) continue;
 
-      const semantic = this.computeSemanticSimilarity(candidate.expression, fp.expression);
-      const structural = fp.structuralFingerprint
-        ? this.computeStructuralSimilarity(candidateStructural, fp.structuralFingerprint)
-        : 0;
-      const candidateOps = candidateStructural.operators;
-      const baselineOps = fp.structuralFingerprint?.operators || [];
-      const candidateFields = candidateStructural.fields;
-      const baselineFields = fp.structuralFingerprint?.fields || [];
-      const operatorOverlap = this.jaccardSimilarity(candidateOps, baselineOps);
-      const fieldOverlap = this.jaccardSimilarity(candidateFields, baselineFields);
+       const semantic = this.computeSemanticSimilarity(candidate.expression, fp.expression);
+       const structural = fp.structuralFingerprint
+         ? this.computeStructuralSimilarity(candidateStructural, fp.structuralFingerprint)
+         : 0;
+       const candidateOps = candidateStructural.operators;
+       const baselineOps = fp.structuralFingerprint?.operators || [];
+       const candidateFields = candidateStructural.fields;
+       const baselineFields = fp.structuralFingerprint?.fields || [];
+       const operatorOverlap = this.jaccardSimilarity(candidateOps, baselineOps);
+       const fieldOverlap = this.jaccardSimilarity(candidateFields, baselineFields);
 
-      const normalizedBaseline = this.normalizeExpressionForComparison(fp.expression);
-      const normalizedSimilarity = this.trigramDiceSimilarity(normalizedCandidate, normalizedBaseline);
+       const normalizedBaseline = this.normalizeExpressionForComparison(fp.expression);
+       const normalizedSimilarity = this.trigramDiceSimilarity(normalizedCandidate, normalizedBaseline);
 
-      const similarity = Math.min(
-        1,
-        semantic * 0.4 +
-        structural * 0.3 +
-        operatorOverlap * 0.15 +
-        fieldOverlap * 0.15
-      );
-      similarities.push({ alphaId, similarity });
+       const similarity = Math.min(
+         1,
+         semantic * 0.4 +
+         structural * 0.3 +
+         operatorOverlap * 0.15 +
+         fieldOverlap * 0.15
+       );
+       const clusterId = this.getOrCreateClusterId(alphaId);
+       similarities.push({ alphaId, clusterId, similarity });
 
-      // Hard near-duplicate gates for strict rejection.
-      if (
-        (semantic >= 0.72 && structural >= 0.72) ||
-        (operatorOverlap >= 0.70 && fieldOverlap >= 0.85) ||
-        normalizedSimilarity >= 0.82
-      ) {
-        hardNearDuplicate = true;
-        hardReason = `Near-duplicate detected vs submitted alpha ${alphaId.slice(0, 8)} (semantic=${(semantic * 100).toFixed(0)}%, structural=${(structural * 100).toFixed(0)}%, normalized=${(normalizedSimilarity * 100).toFixed(0)}%)`;
-      }
+       if (
+         (semantic >= 0.72 && structural >= 0.72) ||
+         (operatorOverlap >= 0.70 && fieldOverlap >= 0.85) ||
+         normalizedSimilarity >= 0.82
+       ) {
+         hardNearDuplicate = true;
+         if (semantic >= 0.72 && structural >= 0.72) {
+           hardReasonType = 'semantic_and_structural';
+         } else if (operatorOverlap >= 0.70 && fieldOverlap >= 0.85) {
+           hardReasonType = 'operator_field_overlap';
+         } else {
+           hardReasonType = 'normalized_expression';
+         }
+       }
      }
 
      similarities.sort((a, b) => b.similarity - a.similarity);
 
      const top3 = similarities.slice(0, 3);
      const maxSimilarity = similarities.length > 0 ? similarities[0].similarity : 0;
-    const accepted = !hardNearDuplicate && maxSimilarity < this.maxCorrelation;
+     const adaptiveThreshold = this.computeAdaptiveThreshold();
+     const accepted = !hardNearDuplicate && maxSimilarity < adaptiveThreshold;
+
+     const rejectionTypes: Record<string, string> = {
+       semantic_and_structural: 'High semantic + structural similarity with existing patterns',
+       operator_field_overlap: 'Similar operator-field combination to existing alphas',
+       normalized_expression: 'Near-duplicate expression structure',
+     };
 
      return {
        accepted,
        averageSimilarity: maxSimilarity,
-       topMatches: top3.slice(0, 5),
-       rejectionReason: accepted ? undefined : (hardReason || `Similarity gate exceeded (${(maxSimilarity * 100).toFixed(1)}% >= ${(this.maxCorrelation * 100).toFixed(1)}%)`),
+       topMatches: top3.map(s => ({ clusterId: s.clusterId, similarity: s.similarity })),
+       rejectionReason: accepted ? undefined : (
+         hardNearDuplicate
+           ? rejectionTypes[hardReasonType] || 'Near-duplicate detected'
+           : `Similarity ${(maxSimilarity * 100).toFixed(1)}% exceeds threshold ${(adaptiveThreshold * 100).toFixed(1)}%`
+       ),
      };
    }
 
@@ -716,30 +804,90 @@ export class DiversityManager {
 
   // --- Correlation Feedback Loop (Rolling Summary) ---
 
-  /**
+/**
    * Record a correlation rejection for use as LLM feedback.
-   * Stores a distilled pattern signature (operators + data fields) without the full expression.
+   * Uses behavioral categories instead of alpha IDs to prevent leaking.
    */
   recordCorrelationRejection(
     candidate: AlphaCandidate,
     result: {
       pcaCoverage: number;
-      topMatches: Array<{ alphaId: string; similarity: number }>;
+      topMatches: Array<{ clusterId: string; similarity: number }>;
     }
   ): void {
-    const patternSignature = this.extractPatternSignature(candidate.expression);
+    const behavioralCategory = this.determineBehavioralCategory(candidate.expression);
+    const failureReason = this.determineFailureReason(candidate);
 
     this.correlationFeedbackQueue.push({
-      similarTo: result.topMatches.map(m => m.alphaId),
+      behavioralCategory,
+      failureReason,
       similarity: result.pcaCoverage,
-      patternSignature,
       timestamp: Date.now(),
     });
 
-    // Keep last 10
     if (this.correlationFeedbackQueue.length > 10) {
       this.correlationFeedbackQueue.shift();
     }
+  }
+
+  private determineBehavioralCategory(expression: string): string {
+    const lower = expression.toLowerCase();
+    const structural = this.extractStructuralFingerprint(expression);
+    const ops = new Set(structural.operators.map(o => o.toLowerCase()));
+
+    if (ops.has('ts_rank') || ops.has('rank') || ops.has('quantile')) {
+      return 'rank_based';
+    }
+    if (ops.has('ts_delta') || ops.has('ts_returns')) {
+      return 'momentum_timing';
+    }
+    if (ops.has('ts_mean') || ops.has('ts_std_dev') || ops.has('ts_sum')) {
+      return 'aggregation';
+    }
+    if (ops.has('group_neutralize') || ops.has('group_zscore')) {
+      return 'group_normalized';
+    }
+    if (ops.has('ts_corr') || ops.has('ts_covariance')) {
+      return 'cross_correlation';
+    }
+    if (/volume|close|price|returns/i.test(lower)) {
+      return 'price_volume_driven';
+    }
+    if (/sentiment|news|analyst/i.test(lower)) {
+      return 'sentiment_driven';
+    }
+
+    return 'structural';
+  }
+
+  private determineFailureReason(candidate: AlphaCandidate): string {
+    const structural = this.extractStructuralFingerprint(candidate.expression);
+    const candidateOps = new Set(structural.operators.map(o => o.toLowerCase()));
+    const candidateFields = new Set(structural.fields.map(f => f.toLowerCase()));
+
+    if (candidateOps.size <= 1) {
+      return 'single_operator_repetition';
+    }
+    if (candidateFields.size === 1) {
+      return 'same_data_field_dependency';
+    }
+    if (candidateOps.has('rank') && candidateOps.has('ts_rank')) {
+      return 'redundant_normalization';
+    }
+    if (candidateOps.has('ts_mean') && candidateOps.has('ts_delta')) {
+      return 'mean_reversion_timing';
+    }
+
+    return 'operator_field_pattern_match';
+  }
+
+  getOrCreateClusterId(alphaId: string): string {
+    if (!this.alphaToCluster.has(alphaId)) {
+      this.clusterCounter++;
+      const clusterLetter = String.fromCharCode(65 + (this.clusterCounter - 1) % 26);
+      this.alphaToCluster.set(alphaId, `Cluster-${clusterLetter}`);
+    }
+    return this.alphaToCluster.get(alphaId)!;
   }
 
   /**
@@ -782,19 +930,46 @@ export class DiversityManager {
     return opPart || fieldPart;
   }
 
-  /**
-   * Return a compact summary of recent correlation rejections for LLM prompts.
-   * Format: Generic pattern-only, no expression details exposed.
-   */
+/**
+    * Return a compact summary of recent correlation rejections for LLM prompts.
+    * Uses behavioral categories only - no alpha IDs or operator details exposed.
+    */
   getCorrelationSummary(): string {
     if (this.correlationFeedbackQueue.length === 0) return '';
 
     const recent = this.correlationFeedbackQueue.slice(-3);
-    const lines = recent.map(r =>
-      `Pattern: [${r.patternSignature}] → ${(r.similarity * 100).toFixed(0)}% correlation`
-    );
+    const lines = recent.map(r => {
+      const categoryLabel = this.getBehavioralCategoryLabel(r.behavioralCategory);
+      const reasonLabel = this.getFailureReasonLabel(r.failureReason);
+      return `${categoryLabel} pattern (${reasonLabel}) — ${(r.similarity * 100).toFixed(0)}% similarity`;
+    });
 
-    return `\n## Recent Correlation Rejections (avoid these operator+field patterns):\n${lines.join('\n')}`;
+    return `\n## Recent Correlation Rejections:\n${lines.join('\n')}\nTry different behavioral patterns.`;
+  }
+
+  private getBehavioralCategoryLabel(category: string): string {
+    const labels: Record<string, string> = {
+      rank_based: 'Rank-based',
+      momentum_timing: 'Momentum timing',
+      aggregation: 'Time-series aggregation',
+      group_normalized: 'Group-normalized',
+      cross_correlation: 'Cross-correlation',
+      price_volume_driven: 'Price/volume-driven',
+      sentiment_driven: 'Sentiment-driven',
+      structural: 'Structural',
+    };
+    return labels[category] || 'Mixed';
+  }
+
+  private getFailureReasonLabel(reason: string): string {
+    const labels: Record<string, string> = {
+      single_operator_repetition: 'repeated operator',
+      same_data_field_dependency: 'same data field',
+      redundant_normalization: 'redundant normalization',
+      mean_reversion_timing: 'mean-reversion timing',
+      operator_field_pattern_match: 'similar operator-field pattern',
+    };
+    return labels[reason] || 'pattern match';
   }
 
   blacklistExpressionPattern(expression: string): string {

@@ -30,6 +30,7 @@ export class ModelProviderClient {
     this.client = new OpenAI({
       baseURL: provider.baseUrl,
       apiKey: provider.apiKey,
+      timeout: 600_000,
     });
   }
 
@@ -125,7 +126,7 @@ export class ModelProviderClient {
         }
 
         const content = completion.choices[0]?.message?.content;
-        if (!content) throw new Error('Empty response from model');
+        if (!content) throw new Error('Empty response from model (possible timeout)');
 
         // Success path: decay adaptive backoff and cache result briefly.
         this.rateLimiter.decayAdaptiveBackoff();
@@ -144,7 +145,7 @@ export class ModelProviderClient {
           this.rateLimiter.applyPenalty(retryAfterMs);
         } else {
           // Exponential backoff with jitter if provider does not specify retry-after.
-          const backoffMs = Math.min(20000, 1200 * (2 ** attempt) + Math.floor(Math.random() * 500));
+          const backoffMs = Math.min(60000, 1200 * (2 ** attempt) + Math.floor(Math.random() * 500));
           this.rateLimiter.applyPenalty(backoffMs);
         }
 

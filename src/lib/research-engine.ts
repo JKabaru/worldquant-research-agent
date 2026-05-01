@@ -662,7 +662,7 @@ export class ResearchEngine {
           reasons: string[];
           pcaCoverage: number;
           pcaRecommendation: string;
-          topMatches: Array<{ alphaId: string; similarity: number }>;
+          topMatches: Array<{ clusterId: string; similarity: number }>;
         } | null = null;
         try {
           correlationResult = await this.diversityManager.evaluateCandidateWithPCA(candidate);
@@ -1049,7 +1049,10 @@ export class ResearchEngine {
       );
       this.diversityManager.recordCorrelationRejection(candidate, {
         pcaCoverage: maxReportedCorrelation,
-        topMatches,
+        topMatches: topMatches.map(m => ({
+          clusterId: this.diversityManager.getOrCreateClusterId(m.alphaId),
+          similarity: m.similarity,
+        })),
       });
       return result;
     }
@@ -2262,7 +2265,7 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
         reasons: string[];
         pcaCoverage: number;
         pcaRecommendation: string;
-        topMatches: Array<{ alphaId: string; similarity: number }>;
+        topMatches: Array<{ clusterId: string; similarity: number }>;
       } | null = null;
       try {
         correlationResult = await this.diversityManager.evaluateCandidateWithPCA(candidate);
