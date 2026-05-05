@@ -888,7 +888,7 @@ export default function Home() {
               ) : (
                 <div className="space-y-3">
                   {providers.map(p => (
-                    <div key={p.id} className={`flex items-center justify-between p-3 rounded-lg border ${p.id === selectedProviderId ? 'border-indigo-500 bg-indigo-500/5' : 'border-gray-800 bg-gray-900/50'}`}>
+                    <div key={p.id} className={`flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 p-3 rounded-lg border ${p.id === selectedProviderId ? 'border-indigo-500 bg-indigo-500/5' : 'border-gray-800 bg-gray-900/50'}`}>
                       <div className="flex items-center gap-3">
                         <button
                           onClick={() => selectProvider(p.id)}
