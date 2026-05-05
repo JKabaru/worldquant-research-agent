@@ -1,7 +1,6 @@
 'use client';
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { useLocalStorage } from '@/lib/useLocalStorage';
 
 // ============================================================
 // Types
@@ -164,18 +163,18 @@ const NEUTRALIZATIONS = ['MARKET', 'SECTOR', 'INDUSTRY', 'SUBINDUSTRY', 'COUNTRY
 
 export default function Home() {
   // Tab state
-  const [activeTab, setActiveTab] = useLocalStorage('ui.activeTab', 'providers');
+  const [activeTab, setActiveTab] = useState('providers');
 
   // Provider state
   const [providers, setProviders] = useState<ModelProvider[]>([]);
   const [presets, setPresets] = useState<ProviderPreset[]>([]);
-  const [selectedProviderId, setSelectedProviderId] = useLocalStorage('selection.providerId', '');
+  const [selectedProviderId, setSelectedProviderId] = useState<string>('');
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [selectedModelId, setSelectedModelId] = useLocalStorage('selection.modelId', '');
-  const [newProviderName, setNewProviderName] = useLocalStorage('provider.name', '');
-  const [newProviderUrl, setNewProviderUrl] = useLocalStorage('provider.url', '');
-  const [newProviderKey, setNewProviderKey] = useLocalStorage('provider.key', '', ['newProviderKey']);
-  const [selectedPreset, setSelectedPreset] = useLocalStorage('provider.preset', '');
+  const [selectedModelId, setSelectedModelId] = useState<string>('');
+  const [newProviderName, setNewProviderName] = useState('');
+  const [newProviderUrl, setNewProviderUrl] = useState('');
+  const [newProviderKey, setNewProviderKey] = useState('');
+  const [selectedPreset, setSelectedPreset] = useState('');
   const [modelsLoading, setModelsLoading] = useState(false);
   const [providerStatus, setProviderStatus] = useState<string>('');
 
@@ -184,8 +183,8 @@ export default function Home() {
   const [validatingModelId, setValidatingModelId] = useState<string | null>(null);
 
   // WQ Auth state
-  const [wqEmail, setWqEmail] = useLocalStorage('auth.email', '');
-  const [wqPassword, setWqPassword] = useLocalStorage('auth.password', '', ['wqPassword']);
+  const [wqEmail, setWqEmail] = useState('');
+  const [wqPassword, setWqPassword] = useState('');
   const [wqAuthenticated, setWqAuthenticated] = useState(false);
   const [wqAuthError, setWqAuthError] = useState('');
 
@@ -199,7 +198,7 @@ export default function Home() {
   const [researchRunning, setResearchRunning] = useState(false);
 
   // Research config
-  const defaultConfig: Partial<ResearchConfig> = {
+  const [config, setConfig] = useState<Partial<ResearchConfig>>({
     region: 'USA',
     universe: 'TOP3000',
     delay: 1,
@@ -216,8 +215,7 @@ export default function Home() {
     targetSharpe: 1.5,
     targetFitness: 1.0,
     maxTurnover: 0.7,
-  };
-  const [config, setConfig] = useLocalStorage('research.config', defaultConfig);
+  });
 
   // Logs
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -235,12 +233,6 @@ export default function Home() {
     sqlite: { connected: boolean; fingerprints: number; experienceReplay: number; simulationLogs: number; lineage: number; generationStats: number; errorLogs: number; feedbackEntries: number; researchSessions: number; databaseSizeBytes: number; walSizeBytes: number; error?: string | null } | null;
     warehouse: { connected: boolean; parquetFiles: number; totalSizeBytes: number; tables: string[]; error?: string | null } | null;
   } | null>(null);
-
-  const passwordsSaved = !!wqPassword || !!newProviderKey;
-
-  // Hydration protection
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
 
   // --- Callbacks (declared before useEffects that use them) ---
 
@@ -813,23 +805,6 @@ export default function Home() {
               LLM: {rateLimitStats.callsInLastMinute}/min
             </span>
           )}
-          {passwordsSaved && (
-            <span className="badge badge-warning text-xs" title="Passwords encrypted in browser">
-              🔐
-            </span>
-          )}
-          <button
-            className="btn btn-xs btn-ghost text-gray-500 hover:text-white"
-            onClick={() => {
-              if (confirm('Clear all saved state? You will need to re-enter credentials.')) {
-                localStorage.clear();
-                window.location.reload();
-              }
-            }}
-            title="Clear saved state"
-          >
-            Clear
-          </button>
         </div>
       </header>
 
@@ -855,13 +830,6 @@ export default function Home() {
 
       {/* Main Content */}
       <main className="flex-1 p-3 sm:p-4 overflow-auto">
-        {!mounted && (
-          <div className="flex items-center justify-center h-64">
-            <div className="text-gray-500">Loading...</div>
-          </div>
-        )}
-        {mounted && (
-        <>
         {/* ===== PROVIDERS TAB ===== */}
         {activeTab === 'providers' && (
           <div className="space-y-6">
@@ -909,14 +877,6 @@ export default function Home() {
               <button className="btn btn-primary" onClick={createProvider}>
                 + Connect Provider
               </button>
-
-              {newProviderKey && (
-                <div className="mt-3 p-2 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
-                  <p className="text-xs text-yellow-400">
-                    🔐 API key will be encrypted and saved in your browser for convenience.
-                  </p>
-                </div>
-              )}
             </div>
 
             {/* Configured Providers */}
@@ -1080,15 +1040,6 @@ export default function Home() {
                 <button className="btn btn-danger" onClick={disconnectWQ}>
                   Disconnect
                 </button>
-
-                {wqPassword && (
-                  <div className="mt-4 p-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
-                    <p className="text-xs text-yellow-400">
-                      🔐 Your password is securely stored (encrypted) in your browser. 
-                      It will auto-populate on your next visit.
-                    </p>
-                  </div>
-                )}
               </div>
             )}
 
@@ -1781,8 +1732,6 @@ export default function Home() {
               <div ref={logEndRef} />
             </div>
           </div>
-        )}
-        </>
         )}
       </main>
 
