@@ -57,6 +57,13 @@ body {
   padding: 1.25rem;
 }
 
+@media (max-width: 640px) {
+  .card {
+    padding: 1rem;
+    border-radius: 0.5rem;
+  }
+}
+
 /* Button styles */
 .btn {
   display: inline-flex;
@@ -71,6 +78,7 @@ body {
   cursor: pointer;
   border: none;
   outline: none;
+  white-space: nowrap;
 }
 .btn:disabled {
   opacity: 0.5;
@@ -98,6 +106,13 @@ body {
 .btn-success:hover:not(:disabled) {
   background: #059669;
 }
+.btn-warning {
+  background: var(--warning);
+  color: black;
+}
+.btn-warning:hover:not(:disabled) {
+  background: #d97706;
+}
 .btn-danger {
   background: var(--destructive);
   color: var(--destructive-foreground);
@@ -108,6 +123,17 @@ body {
 .btn-sm {
   padding: 0.25rem 0.75rem;
   font-size: 0.75rem;
+}
+
+@media (max-width: 640px) {
+  .btn {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.8125rem;
+  }
+  .btn-sm {
+    padding: 0.25rem 0.5rem;
+    font-size: 0.6875rem;
+  }
 }
 
 /* Input styles */
@@ -128,6 +154,13 @@ body {
 }
 .input::placeholder {
   color: var(--muted-foreground);
+}
+
+@media (max-width: 640px) {
+  .input {
+    padding: 0.5rem 0.625rem;
+    font-size: 0.8125rem;
+  }
 }
 
 /* Select */
@@ -257,6 +290,13 @@ tr:hover td {
   max-height: 300px;
   overflow-y: auto;
   line-height: 1.6;
+}
+@media (max-width: 640px) {
+  .log-console {
+    padding: 0.5rem;
+    font-size: 0.6875rem;
+    max-height: 200px;
+  }
 }
 .log-entry {
   padding: 0.125rem 0;

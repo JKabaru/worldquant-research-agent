@@ -1340,6 +1340,24 @@ export class AlphaDatabase {
     this.db.pragma('wal_checkpoint(TRUNCATE)');
   }
 
+  clearAllData(): void {
+    const transaction = this.db.transaction(() => {
+      this.db.exec('DELETE FROM alpha_fingerprints');
+      this.db.exec('DELETE FROM experience_replay');
+      this.db.exec('DELETE FROM lineage_data');
+      this.db.exec('DELETE FROM simulation_logs');
+      this.db.exec('DELETE FROM research_sessions');
+      this.db.exec('DELETE FROM research_traces');
+      this.db.exec('DELETE FROM memory_nodes');
+      this.db.exec('DELETE FROM memory_edges');
+      this.db.exec('DELETE FROM retrieval_traces');
+      this.db.exec('DELETE FROM error_logs');
+      this.db.exec('DELETE FROM feedback_entries');
+      this.db.exec('DELETE FROM generation_stats');
+    });
+    transaction();
+  }
+
   close(): void {
     this.checkpoint();
     this.db.close();

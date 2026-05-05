@@ -57,6 +57,8 @@ export class ResearchEngine {
     payload?: Record<string, unknown>;
     timestamp: string;
   }> = [];
+  // Track pending timeouts for cancellation on stop/reset
+  private pendingTimeouts = new Set<ReturnType<typeof setTimeout>>();
 
   constructor() {
     this.validator = new AlphaValidator();
@@ -361,23 +363,57 @@ export class ResearchEngine {
   stop(): void {
     this.state.status = 'stopping';
     this.abortController?.abort();
+    // Cancel all pending timeouts
+    for (const timeoutId of this.pendingTimeouts) {
+      clearTimeout(timeoutId);
+    }
+    this.pendingTimeouts.clear();
     this.state.lastActivity = new Date().toISOString();
 
-    // Persist session end state
+    // Persist session end state (non-blocking)
     if (this.dbInitialized) {
-      try {
-        getDatabase().updateSessionActivity(this.state.id, 'stopped', {
-          totalSimulations: this.state.totalSimulations,
-          successfulAlphas: this.state.successfulAlphas,
-          failedSimulations: this.state.failedSimulations,
-          currentGeneration: this.state.currentGeneration,
-        });
-        // Clear paused session state
-        getDatabase().saveSessionSnapshot(this.state.id, '');
-      } catch { /* non-fatal */ }
+      setImmediate(() => {
+        try {
+          getDatabase().updateSessionActivity(this.state.id, 'stopped', {
+            totalSimulations: this.state.totalSimulations,
+            successfulAlphas: this.state.successfulAlphas,
+            failedSimulations: this.state.failedSimulations,
+            currentGeneration: this.state.currentGeneration,
+          });
+          getDatabase().saveSessionSnapshot(this.state.id, '');
+        } catch { /* non-fatal */ }
+      });
     }
 
     this.emit({ type: 'status', data: { status: 'stopping', message: 'Research engine stopping...' } });
+  }
+
+  // --- Reset Research (full wipe) ---
+  reset(): void {
+    this.state.status = 'stopping';
+    this.abortController?.abort();
+    // Cancel all pending timeouts
+    for (const timeoutId of this.pendingTimeouts) {
+      clearTimeout(timeoutId);
+    }
+    this.pendingTimeouts.clear();
+
+    // Reset in-memory state
+    this.state = this.createInitialState();
+
+    // Reset diversity manager
+    this.diversityManager.reset();
+
+    // Clear all database tables (non-blocking)
+    setImmediate(() => {
+      try {
+        const db = getDatabase();
+        db.clearAllData();
+        db.checkpoint();
+      } catch { /* non-fatal */ }
+    });
+
+    this.emit({ type: 'status', data: { status: 'idle', message: 'Research engine reset - all data cleared' } });
   }
 
   // --- Pause Research (Gap 5) ---
@@ -731,7 +767,8 @@ export class ResearchEngine {
         // Stagger submissions within a batch by 2 seconds each
         const submitPromises = batch.map((candidate, idx) =>
           new Promise<{ candidate: AlphaCandidate; result: WQSimulationResult | null }>((resolve) => {
-            setTimeout(async () => {
+            const timeoutId = setTimeout(async () => {
+              this.pendingTimeouts.delete(timeoutId);
               if (this.abortController?.signal.aborted || this.state.status !== 'running') {
                 resolve({ candidate, result: null });
                 return;
@@ -739,6 +776,7 @@ export class ResearchEngine {
               const result = await this.submitSimulation(candidate);
               resolve({ candidate, result });
             }, idx * 2000); // 2-second stagger within batch
+            this.pendingTimeouts.add(timeoutId);
           })
         );
 

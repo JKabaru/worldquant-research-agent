@@ -178,6 +178,10 @@ export default function Home() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [providerStatus, setProviderStatus] = useState<string>('');
 
+  // Model validation state
+  const [validatedModels, setValidatedModels] = useState<Record<string, { success: boolean; message: string; timestamp: number }>>({});
+  const [validatingModelId, setValidatingModelId] = useState<string | null>(null);
+
   // WQ Auth state
   const [wqEmail, setWqEmail] = useState('');
   const [wqPassword, setWqPassword] = useState('');
@@ -393,6 +397,51 @@ export default function Home() {
     }
   };
 
+  const validateModel = async (providerId: string, modelId: string) => {
+    const cacheKey = `${providerId}:${modelId}`;
+    const cached = validatedModels[cacheKey];
+    if (cached && Date.now() - cached.timestamp < 5 * 60 * 1000) {
+      return cached;
+    }
+
+    setValidatingModelId(modelId);
+    try {
+      const res = await fetch(`/api/providers/${providerId}/validate-model`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modelId }),
+      });
+      const data = await res.json();
+
+      const result = {
+        success: data.success,
+        message: data.message,
+        timestamp: Date.now(),
+      };
+
+      setValidatedModels(prev => ({ ...prev, [cacheKey]: result }));
+
+      if (data.success) {
+        addLog('success', `Model ${modelId} validated: ${data.message}`);
+      } else {
+        addLog('warning', `Model ${modelId} validation failed: ${data.message}`);
+      }
+
+      return result;
+    } catch (error) {
+      const result = {
+        success: false,
+        message: error instanceof Error ? error.message : 'Validation failed',
+        timestamp: Date.now(),
+      };
+      setValidatedModels(prev => ({ ...prev, [cacheKey]: result }));
+      addLog('error', `Model ${modelId} validation error: ${result.message}`);
+      return result;
+    } finally {
+      setValidatingModelId(null);
+    }
+  };
+
   const createProvider = async () => {
     if (!newProviderName || !newProviderUrl || !newProviderKey) {
       addLog('warning', 'All fields are required to create a provider');
@@ -552,6 +601,25 @@ export default function Home() {
       return;
     }
 
+    const cacheKey = `${selectedProviderId}:${selectedModelId}`;
+    const validation = validatedModels[cacheKey];
+
+    if (!validation) {
+      addLog('info', 'Validating model before starting research...');
+      const result = await validateModel(selectedProviderId, selectedModelId);
+      if (!result.success) {
+        if (!confirm(`Model validation failed: ${result.message}\n\nDo you want to proceed anyway?`)) {
+          return;
+        }
+        addLog('warning', 'Proceeding with unvalidated model');
+      }
+    } else if (!validation.success) {
+      if (!confirm(`Model validation previously failed: ${validation.message}\n\nDo you want to proceed anyway?`)) {
+        return;
+      }
+      addLog('warning', 'Proceeding with previously failed model');
+    }
+
     try {
       const res = await fetch('/api/research/start', {
         method: 'POST',
@@ -584,6 +652,20 @@ export default function Home() {
       await pollResearchStatus();
     } catch {
       addLog('error', 'Failed to stop research');
+    }
+  };
+
+  const resetResearch = async () => {
+    if (!confirm('Reset will wipe ALL data (alphas, fingerprints, experience, logs). This cannot be undone. Continue?')) {
+      return;
+    }
+    try {
+      await fetch('/api/research/reset', { method: 'POST' });
+      setResearchRunning(false);
+      addLog('info', 'Research engine reset - all data cleared');
+      await pollResearchStatus();
+    } catch {
+      addLog('error', 'Failed to reset research');
     }
   };
 
@@ -692,31 +774,31 @@ export default function Home() {
   return (
     <div className="min-h-screen flex flex-col">
       {/* Header */}
-      <header className="border-b border-gray-800 px-6 py-3 flex items-center justify-between bg-gray-900/50 backdrop-blur-sm sticky top-0 z-50">
+      <header className="border-b border-gray-800 px-3 sm:px-4 py-3 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-gray-900/50 backdrop-blur-sm sticky top-0 z-50">
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold text-sm">
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold text-sm shrink-0">
             WQ
           </div>
-          <div>
-            <h1 className="text-lg font-bold text-white leading-tight">WorldQuant BRAIN Research Agent</h1>
-            <p className="text-xs text-gray-500">Model-Agnostic Automated Quantitative Research Architecture</p>
+          <div className="min-w-0">
+            <h1 className="text-base sm:text-lg font-bold text-white leading-tight truncate">WQ Research Agent</h1>
+            <p className="text-xs text-gray-500 hidden sm:block">Model-Agnostic Automated Quantitative Research</p>
           </div>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
           <div className="flex items-center gap-2">
             <div className={`w-2 h-2 rounded-full ${researchRunning ? 'bg-green-400 animate-pulse-dot' : researchStatus?.status === 'paused' ? 'bg-yellow-400' : 'bg-gray-600'}`} />
-            <span className="text-xs text-gray-400 font-mono">
+            <span className="text-xs text-gray-400 font-mono hidden sm:inline">
               {researchRunning ? 'RUNNING' : researchStatus?.status === 'paused' ? 'PAUSED' : 'IDLE'}
             </span>
           </div>
           {wqAuthenticated && (
-            <span className="badge badge-success">WQ Connected</span>
+            <span className="badge badge-success text-xs">WQ</span>
           )}
           {!wqAuthenticated && (
-            <span className="badge badge-neutral">WQ Disconnected</span>
+            <span className="badge badge-neutral text-xs">WQ</span>
           )}
           {selectedModelId && (
-            <span className="badge badge-info truncate max-w-[200px]">{selectedModelId}</span>
+            <span className="badge badge-info truncate max-w-[120px] sm:max-w-[200px] text-xs">{selectedModelId}</span>
           )}
           {rateLimitStats && researchRunning && (
             <span className="text-xs text-gray-500 font-mono hidden lg:inline">
@@ -727,8 +809,8 @@ export default function Home() {
       </header>
 
       {/* Tab Navigation */}
-      <nav className="border-b border-gray-800 px-6 bg-gray-900/30">
-        <div className="flex gap-1">
+      <nav className="border-b border-gray-800 px-2 sm:px-4 bg-gray-900/30 overflow-x-auto">
+        <div className="flex gap-1 min-w-max">
           {tabs.map(tab => (
             <button
               key={tab.id}
@@ -739,14 +821,15 @@ export default function Home() {
               }}
               className={`tab ${activeTab === tab.id ? 'tab-active' : ''}`}
             >
-              {tab.label}
+              <span className="hidden sm:inline">{tab.label}</span>
+              <span className="sm:hidden">{tab.label.split(' ')[0]}</span>
             </button>
           ))}
         </div>
       </nav>
 
       {/* Main Content */}
-      <main className="flex-1 p-6 overflow-auto">
+      <main className="flex-1 p-3 sm:p-4 overflow-auto">
         {/* ===== PROVIDERS TAB ===== */}
         {activeTab === 'providers' && (
           <div className="space-y-6">
@@ -756,7 +839,7 @@ export default function Home() {
                 <span className="text-indigo-400">&#9889;</span> Connect Model Provider
               </h2>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 mb-4">
                 <div>
                   <label className="block text-xs text-gray-400 mb-1">Preset</label>
                   <select
@@ -837,23 +920,63 @@ export default function Home() {
                   {providerStatus && <span className="text-sm font-normal text-gray-400 ml-2">{providerStatus}</span>}
                 </h2>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2 max-h-[400px] overflow-y-auto">
-                  {models.map(m => (
-                    <button
-                      key={m.id}
-                      onClick={() => setSelectedModelId(m.id)}
-                      className={`p-3 rounded-lg border text-left transition-all ${m.id === selectedModelId ? 'border-indigo-500 bg-indigo-500/10' : 'border-gray-800 hover:border-gray-600 hover:bg-gray-900/50'}`}
-                    >
-                      <div className="font-mono text-sm font-medium truncate">{m.id}</div>
-                      <div className="text-xs text-gray-500 mt-1">{m.provider}</div>
-                    </button>
-                  ))}
+                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2 max-h-[400px] overflow-y-auto">
+                  {models.map(m => {
+                    const cacheKey = `${selectedProviderId}:${m.id}`;
+                    const validation = validatedModels[cacheKey];
+                    const isValidating = validatingModelId === m.id;
+
+                    return (
+                      <button
+                        key={m.id}
+                        onClick={() => {
+                          setSelectedModelId(m.id);
+                          validateModel(selectedProviderId, m.id);
+                        }}
+                        className={`p-3 rounded-lg border text-left transition-all relative ${m.id === selectedModelId ? 'border-indigo-500 bg-indigo-500/10' : 'border-gray-800 hover:border-gray-600 hover:bg-gray-900/50'}`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="font-mono text-sm font-medium truncate flex-1">{m.id}</div>
+                          <div className="ml-2">
+                            {isValidating ? (
+                              <span className="text-yellow-400 text-xs">⏳</span>
+                            ) : validation ? (
+                              validation.success ? (
+                                <span className="text-green-400 text-xs" title={validation.message}>✓</span>
+                              ) : (
+                                <span className="text-red-400 text-xs" title={validation.message}>✗</span>
+                              )
+                            ) : null}
+                          </div>
+                        </div>
+                        <div className="text-xs text-gray-500 mt-1">{m.provider}</div>
+                      </button>
+                    );
+                  })}
                 </div>
 
                 {selectedModelId && (
-                  <div className="mt-4 p-3 bg-green-500/10 border border-green-500/20 rounded-lg">
-                    <span className="text-green-400 font-medium text-sm">Selected: </span>
-                    <span className="font-mono text-sm">{selectedModelId}</span>
+                  <div className="mt-4 p-3 rounded-lg border bg-gray-900/50">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <span className="text-gray-400 font-medium text-sm">Selected: </span>
+                        <span className="font-mono text-sm">{selectedModelId}</span>
+                      </div>
+                      {(() => {
+                        const cacheKey = `${selectedProviderId}:${selectedModelId}`;
+                        const validation = validatedModels[cacheKey];
+                        if (!validation) return null;
+                        return validation.success ? (
+                          <span className="text-green-400 text-xs flex items-center gap-1">
+                            <span>✓</span> Validated
+                          </span>
+                        ) : (
+                          <span className="text-red-400 text-xs flex items-center gap-1" title={validation.message}>
+                            <span>✗</span> Failed
+                          </span>
+                        );
+                      })()}
+                    </div>
                   </div>
                 )}
               </div>
@@ -995,28 +1118,28 @@ export default function Home() {
               </p>
 
               {/* Prerequisites */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-5">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-5">
                 <div className={`p-3 rounded-lg border flex items-center gap-3 ${wqAuthenticated ? 'border-green-500/30 bg-green-500/5' : 'border-red-500/30 bg-red-500/5'}`}>
-                  <div className={`w-5 h-5 rounded-full flex items-center justify-center text-xs ${wqAuthenticated ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+                  <div className={`w-5 h-5 rounded-full flex items-center justify-center text-xs shrink-0 ${wqAuthenticated ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
                     {wqAuthenticated ? '✓' : '!'}
                   </div>
-                  <div>
-                    <div className="text-xs font-medium">{wqAuthenticated ? 'WQ BRAIN Connected' : 'WQ BRAIN Not Connected'}</div>
-                    <div className="text-xs text-gray-500">Required for simulation submission</div>
+                  <div className="min-w-0">
+                    <div className="text-xs font-medium truncate">{wqAuthenticated ? 'WQ BRAIN Connected' : 'WQ BRAIN Not Connected'}</div>
+                    <div className="text-xs text-gray-500 hidden sm:inline">Required for simulation</div>
                   </div>
                 </div>
                 <div className={`p-3 rounded-lg border flex items-center gap-3 ${selectedModelId ? 'border-green-500/30 bg-green-500/5' : 'border-red-500/30 bg-red-500/5'}`}>
-                  <div className={`w-5 h-5 rounded-full flex items-center justify-center text-xs ${selectedModelId ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+                  <div className={`w-5 h-5 rounded-full flex items-center justify-center text-xs shrink-0 ${selectedModelId ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
                     {selectedModelId ? '✓' : '!'}
                   </div>
-                  <div>
-                    <div className="text-xs font-medium">{selectedModelId ? `Model: ${selectedModelId.slice(0, 30)}${selectedModelId.length > 30 ? '...' : ''}` : 'No Model Selected'}</div>
-                    <div className="text-xs text-gray-500">Required for FASTEXPR generation</div>
+                  <div className="min-w-0">
+                    <div className="text-xs font-medium truncate">{selectedModelId ? `Model: ${selectedModelId}` : 'No Model Selected'}</div>
+                    <div className="text-xs text-gray-500 hidden sm:inline">Required for generation</div>
                   </div>
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4 mb-4">
                 <div>
                   <label className="block text-xs text-gray-400 mb-1">Strategy</label>
                   <select className="select" value={config.researchStrategy} onChange={e => setConfig({ ...config, researchStrategy: e.target.value })}>
@@ -1106,6 +1229,9 @@ export default function Home() {
                   <div className="flex gap-2">
                     <button className="btn btn-danger" onClick={stopResearch}>
                       Stop
+                    </button>
+                    <button className="btn btn-warning" onClick={resetResearch}>
+                      Reset
                     </button>
                     <button className="btn btn-secondary" onClick={pauseResearch}>
                       Pause
@@ -1233,7 +1359,7 @@ export default function Home() {
 
             {/* Status Dashboard */}
             {researchStatus && (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                 <div className="metric-card">
                   <div className="metric-label">Generation</div>
                   <div className="metric-value text-indigo-400">{researchStatus.currentGeneration}</div>
@@ -1299,7 +1425,7 @@ export default function Home() {
 
             {/* Diversity Metrics */}
             {researchStatus?.diversityMetrics && (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div className="card">
                   <h3 className="text-sm font-semibold mb-3 text-gray-300">Diversity Metrics</h3>
                   <div className="space-y-2 text-sm">
@@ -1532,7 +1658,7 @@ export default function Home() {
             {/* What Gets Stored */}
             <div className="card">
               <h3 className="text-sm font-semibold mb-3">What Gets Persisted</h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs text-gray-400">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs text-gray-400">
                 <div className="space-y-2">
                   <div className="font-semibold text-gray-300">SQLite (Bookkeeping)</div>
                   <ul className="space-y-1 list-disc list-inside">
