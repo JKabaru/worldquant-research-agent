@@ -238,6 +238,10 @@ export default function Home() {
 
   const passwordsSaved = !!wqPassword || !!newProviderKey;
 
+  // Hydration protection
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
   // --- Callbacks (declared before useEffects that use them) ---
 
   const logIdCounter = useRef(0);
@@ -851,6 +855,13 @@ export default function Home() {
 
       {/* Main Content */}
       <main className="flex-1 p-3 sm:p-4 overflow-auto">
+        {!mounted && (
+          <div className="flex items-center justify-center h-64">
+            <div className="text-gray-500">Loading...</div>
+          </div>
+        )}
+        {mounted && (
+        <>
         {/* ===== PROVIDERS TAB ===== */}
         {activeTab === 'providers' && (
           <div className="space-y-6">
@@ -1770,6 +1781,8 @@ export default function Home() {
               <div ref={logEndRef} />
             </div>
           </div>
+        )}
+        </>
         )}
       </main>
 

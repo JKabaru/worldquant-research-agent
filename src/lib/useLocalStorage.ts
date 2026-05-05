@@ -3,6 +3,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { encrypt, decrypt } from './crypto';
 
+const canUseStorage = typeof window !== 'undefined' && typeof localStorage !== 'undefined';
+
 async function decryptFields(
   obj: Record<string, unknown>,
   fields: string[]
@@ -26,6 +28,10 @@ export function useLocalStorage<T>(
 
   useEffect(() => {
     const load = async () => {
+      if (!canUseStorage) {
+        setIsLoaded(true);
+        return;
+      }
       try {
         const item = localStorage.getItem(key);
         if (item) {
@@ -43,6 +49,7 @@ export function useLocalStorage<T>(
 
   const setValue = useCallback(
     (value: T | ((prev: T) => T)) => {
+      if (!canUseStorage) return;
       try {
         setStoredValue(prev => {
           const newValue = value instanceof Function ? value(prev) : value;
@@ -63,6 +70,7 @@ export function useLocalStorage<T>(
   );
 
   const clearValue = useCallback(() => {
+    if (!canUseStorage) return;
     localStorage.removeItem(key);
     setStoredValue(defaultValue);
   }, [key, defaultValue]);

@@ -1,3 +1,7 @@
+const isBrowser = typeof window !== 'undefined' && 
+  typeof crypto !== 'undefined' && 
+  typeof crypto.subtle !== 'undefined';
+
 const SALT = 'wq-research-agent-v1';
 
 async function getKey(): Promise<CryptoKey> {
@@ -25,26 +29,30 @@ async function getKey(): Promise<CryptoKey> {
 }
 
 export async function encrypt(plaintext: string): Promise<string> {
-  if (!plaintext) return '';
-  const encoder = new TextEncoder();
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await getKey();
+  if (!isBrowser || !plaintext) return plaintext;
+  try {
+    const encoder = new TextEncoder();
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await getKey();
 
-  const encrypted = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    encoder.encode(plaintext)
-  );
+    const encrypted = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      key,
+      encoder.encode(plaintext)
+    );
 
-  const combined = new Uint8Array(iv.length + encrypted.byteLength);
-  combined.set(iv);
-  combined.set(new Uint8Array(encrypted), iv.length);
+    const combined = new Uint8Array(iv.length + encrypted.byteLength);
+    combined.set(iv);
+    combined.set(new Uint8Array(encrypted), iv.length);
 
-  return btoa(String.fromCharCode(...combined));
+    return btoa(String.fromCharCode(...combined));
+  } catch {
+    return plaintext;
+  }
 }
 
 export async function decrypt(ciphertext: string): Promise<string> {
-  if (!ciphertext) return '';
+  if (!isBrowser || !ciphertext) return ciphertext;
   try {
     const encoder = new TextEncoder();
     const combined = Uint8Array.from(atob(ciphertext), c => c.charCodeAt(0));
