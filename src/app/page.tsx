@@ -182,6 +182,10 @@ export default function Home() {
   const [validatedModels, setValidatedModels] = useState<Record<string, { success: boolean; message: string; timestamp: number }>>({});
   const [validatingModelId, setValidatingModelId] = useState<string | null>(null);
 
+  // Model settings state
+  const [thinkingEffort, setThinkingEffort] = useState<string>('auto');
+  const [fallbackModelId, setFallbackModelId] = useState<string>('');
+
   // WQ Auth state
   const [wqEmail, setWqEmail] = useState('');
   const [wqPassword, setWqPassword] = useState('');
@@ -976,6 +980,35 @@ export default function Home() {
                           </span>
                         );
                       })()}
+                    </div>
+
+                    <div className="mt-3 pt-3 border-t border-gray-800">
+                      <label className="block text-xs text-gray-400 mb-2">Thinking Effort</label>
+                      <select
+                        className="input"
+                        value={thinkingEffort}
+                        onChange={e => setThinkingEffort(e.target.value)}
+                      >
+                        <option value="auto">Auto (Model Default)</option>
+                        <option value="disabled">Disabled</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                      </select>
+                    </div>
+
+                    <div className="mt-3 pt-3 border-t border-gray-800">
+                      <label className="block text-xs text-gray-400 mb-2">Fallback Model (auto-switch on failure)</label>
+                      <select
+                        className="input"
+                        value={fallbackModelId}
+                        onChange={e => setFallbackModelId(e.target.value)}
+                      >
+                        <option value="">None</option>
+                        {models.filter(m => m.id !== selectedModelId).map(m => (
+                          <option key={m.id} value={m.id}>{m.id}</option>
+                        ))}
+                      </select>
                     </div>
                   </div>
                 )}

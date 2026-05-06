@@ -3,7 +3,7 @@
 // ============================================================
 
 import OpenAI from 'openai';
-import { ModelInfo, ModelProvider, ProviderPreset } from './types';
+import { ModelInfo, ModelProvider, ProviderPreset, ThinkingConfig, ProviderHealth, FallbackConfig } from './types';
 import { PROVIDER_PRESETS } from './constants';
 import { RateLimiter } from './rate-limiter';
 import { getDatabase } from './persistence/database';
@@ -16,6 +16,28 @@ export class ModelProviderClient {
   private cacheHits = 0;
   private cacheMisses = 0;
   private retryCount = 0;
+
+  private health: ProviderHealth = {
+    consecutiveFailures: 0,
+    totalFailures: 0,
+    lastSuccess: null,
+    avgLatencyMs: 0,
+    isStuck: false,
+  };
+
+  private fallbackConfig: FallbackConfig = {
+    enabled: false,
+    fallbackModelId: null,
+    failureThreshold: 5,
+  };
+
+  private thinkingConfig: ThinkingConfig = {
+    mode: 'auto',
+    budgetTokens: 8000,
+  };
+
+  private currentModelId: string | null = null;
+  private primaryModelId: string | null = null;
 
   constructor() {
     this.rateLimiter = new RateLimiter({
@@ -32,19 +54,115 @@ export class ModelProviderClient {
       apiKey: provider.apiKey,
       timeout: 600_000,
     });
+    this.resetHealth();
   }
 
   disconnect(): void {
     this.client = null;
     this.provider = null;
+    this.currentModelId = null;
+    this.primaryModelId = null;
   }
 
   isConnected(): boolean {
     return this.client !== null;
   }
 
-  getProvider(): ModelProvider | null {
-    return this.provider;
+  setCurrentModel(modelId: string): void {
+    if (!this.primaryModelId) {
+      this.primaryModelId = modelId;
+    }
+    this.currentModelId = modelId;
+  }
+
+  getCurrentModel(): string | null {
+    return this.currentModelId;
+  }
+
+  getPrimaryModel(): string | null {
+    return this.primaryModelId;
+  }
+
+  isUsingFallback(): boolean {
+    return this.currentModelId !== null && this.primaryModelId !== null && this.currentModelId !== this.primaryModelId;
+  }
+
+  setThinkingConfig(config: ThinkingConfig): void {
+    this.thinkingConfig = config;
+  }
+
+  getThinkingConfig(): ThinkingConfig {
+    return this.thinkingConfig;
+  }
+
+  setFallbackConfig(config: FallbackConfig): void {
+    this.fallbackConfig = { ...this.fallbackConfig, ...config };
+  }
+
+  getFallbackConfig(): FallbackConfig {
+    return this.fallbackConfig;
+  }
+
+  private resetHealth(): void {
+    this.health = {
+      consecutiveFailures: 0,
+      totalFailures: 0,
+      lastSuccess: null,
+      avgLatencyMs: 0,
+      isStuck: false,
+    };
+  }
+
+  recordFailure(): void {
+    this.health.consecutiveFailures++;
+    this.health.totalFailures++;
+    if (this.health.consecutiveFailures >= 3) {
+      this.health.isStuck = true;
+    }
+  }
+
+  recordSuccess(latencyMs: number): void {
+    this.health.lastSuccess = new Date().toISOString();
+    this.health.consecutiveFailures = 0;
+    this.health.isStuck = false;
+    if (this.health.avgLatencyMs === 0) {
+      this.health.avgLatencyMs = latencyMs;
+    } else {
+      this.health.avgLatencyMs = (this.health.avgLatencyMs * 0.7) + (latencyMs * 0.3);
+    }
+  }
+
+  getHealth(): ProviderHealth {
+    return { ...this.health };
+  }
+
+  shouldUseFallback(): boolean {
+    return (
+      this.fallbackConfig.enabled &&
+      this.fallbackConfig.fallbackModelId !== null &&
+      this.health.consecutiveFailures >= this.fallbackConfig.failureThreshold
+    );
+  }
+
+  getFallbackModelId(): string | null {
+    return this.fallbackConfig.fallbackModelId;
+  }
+
+  switchToFallback(): void {
+    if (this.fallbackConfig.fallbackModelId) {
+      this.currentModelId = this.fallbackConfig.fallbackModelId;
+      this.health.isStuck = false;
+    }
+  }
+
+  switchToPrimary(): void {
+    if (this.primaryModelId) {
+      this.currentModelId = this.primaryModelId;
+    }
+  }
+
+  getActiveModelId(): string {
+    return this.currentModelId || this.primaryModelId || '';
   }
 
   async listModels(): Promise<ModelInfo[]> {
@@ -80,46 +198,58 @@ export class ModelProviderClient {
     modelId: string,
     temperature: number = 0.7,
     maxTokens: number = 4096,
-    responseFormat?: { type: 'json_object' | 'text' }
+    responseFormat?: { type: 'json_object' | 'text' },
+    thinking?: ThinkingConfig
   ): Promise<string> {
     if (!this.client) throw new Error('Provider not connected');
 
-    // Short-lived cache to avoid duplicate calls from retries/re-entrant flows.
+    this.setCurrentModel(modelId);
+    const startTime = Date.now();
+
+    const activeThinking = thinking || this.thinkingConfig;
+
     const cacheKey = this.buildCompletionCacheKey(messages, modelId, temperature, maxTokens, responseFormat);
     const cached = this.getCachedCompletion(cacheKey);
     if (cached) return cached;
 
-    // Rate limit the LLM call
     await this.rateLimiter.acquire();
     const maxRetries = 3;
+    let lastError: Error | null = null;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         let completion;
+
+        const baseParams = {
+          model: modelId,
+          messages: messages.map(m => ({
+            role: m.role as 'system' | 'user' | 'assistant',
+            content: m.content,
+          })),
+          temperature,
+          max_tokens: maxTokens,
+        };
+
         try {
-          completion = await this.client.chat.completions.create({
-            model: modelId,
-            messages: messages.map(m => ({
-              role: m.role as 'system' | 'user' | 'assistant',
-              content: m.content,
-            })),
-            temperature,
-            max_tokens: maxTokens,
-            ...(responseFormat ? { response_format: responseFormat } : {}),
-          });
-        } catch (formatErr: unknown) {
-          // Some OpenAI-compatible providers/models reject `response_format`.
-          // Retry once without it so JSON-prompted callers can still proceed.
-          if (responseFormat && this.isUnsupportedResponseFormatError(formatErr)) {
+          if (activeThinking.mode !== 'disabled' && activeThinking.mode !== 'auto') {
             completion = await this.client.chat.completions.create({
-              model: modelId,
-              messages: messages.map(m => ({
-                role: m.role as 'system' | 'user' | 'assistant',
-                content: m.content,
-              })),
-              temperature,
-              max_tokens: maxTokens,
+              ...baseParams,
+              ...(responseFormat ? { response_format: responseFormat } : {}),
+              // @ts-expect-error - thinking is not in SDK types yet but supported by OpenAI API
+              thinking: {
+                type: 'enabled' as const,
+                budget_tokens: activeThinking.budgetTokens || 8000,
+              },
             });
+          } else {
+            completion = await this.client.chat.completions.create({
+              ...baseParams,
+              ...(responseFormat ? { response_format: responseFormat } : {}),
+            });
+          }
+        } catch (formatErr: unknown) {
+          if (responseFormat && this.isUnsupportedResponseFormatError(formatErr)) {
+            completion = await this.client.chat.completions.create(baseParams);
           } else {
             throw formatErr;
           }
@@ -128,13 +258,15 @@ export class ModelProviderClient {
         const content = completion.choices[0]?.message?.content;
         if (!content) throw new Error('Empty response from model (possible timeout)');
 
-        // Success path: decay adaptive backoff and cache result briefly.
         this.rateLimiter.decayAdaptiveBackoff();
         this.setCachedCompletion(cacheKey, content, 120000);
+        this.recordSuccess(Date.now() - startTime);
         return content;
       } catch (error: unknown) {
+        lastError = error instanceof Error ? error : new Error(String(error));
         if (attempt >= maxRetries || !this.isRetryableCompletionError(error)) {
-          const msg = error instanceof Error ? error.message : String(error);
+          this.recordFailure();
+          const msg = lastError.message;
           throw new Error(`Chat completion failed: ${msg}`);
         }
 
@@ -144,7 +276,6 @@ export class ModelProviderClient {
         if (retryAfterMs > 0) {
           this.rateLimiter.applyPenalty(retryAfterMs);
         } else {
-          // Exponential backoff with jitter if provider does not specify retry-after.
           const backoffMs = Math.min(60000, 1200 * (2 ** attempt) + Math.floor(Math.random() * 500));
           this.rateLimiter.applyPenalty(backoffMs);
         }
@@ -153,7 +284,8 @@ export class ModelProviderClient {
       }
     }
 
-    throw new Error('Chat completion failed after retries');
+    this.recordFailure();
+    throw lastError || new Error('Chat completion failed after retries');
   }
 
   async testConnection(): Promise<{ success: boolean; message: string; modelCount?: number }> {

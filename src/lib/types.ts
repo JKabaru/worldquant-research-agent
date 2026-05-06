@@ -22,6 +22,27 @@ export interface ModelInfo {
   description?: string;
 }
 
+export type ThinkingMode = 'auto' | 'disabled' | 'low' | 'medium' | 'high';
+
+export interface ThinkingConfig {
+  mode: ThinkingMode;
+  budgetTokens?: number;
+}
+
+export interface ProviderHealth {
+  consecutiveFailures: number;
+  totalFailures: number;
+  lastSuccess: string | null;
+  avgLatencyMs: number;
+  isStuck: boolean;
+}
+
+export interface FallbackConfig {
+  enabled: boolean;
+  fallbackModelId: string | null;
+  failureThreshold: number;
+}
+
 export type ProviderType = 'openai' | 'anthropic' | 'nvidia' | 'google' | 'opencode' | 'custom';
 
 export interface ProviderPreset {

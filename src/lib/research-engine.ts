@@ -1312,6 +1312,13 @@ export class ResearchEngine {
       }
     }
 
+    this.checkAndHandleFallback();
+
+    const health = provider.getHealth();
+    if (health.consecutiveFailures > 0) {
+      await this.applyProviderBackoff();
+    }
+
     const style = outerResult.datasetRotation[0] || 'momentum';
     const styleConfig = STYLE_PREMIA_CONFIG[style as keyof typeof STYLE_PREMIA_CONFIG];
 
@@ -2952,6 +2959,53 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       this.logError('provider', 'Failed to reconnect provider', undefined, msg);
+    }
+  }
+
+  private checkAndHandleFallback(): void {
+    const client = getProviderClient();
+    const health = client.getHealth();
+
+    if (health.consecutiveFailures >= 3 && health.consecutiveFailures < 5) {
+      this.emit({
+        type: 'error',
+        data: {
+          level: 'warning',
+          message: `Model failing repeatedly (${health.consecutiveFailures}x). Consider switching to a fallback model.`,
+          details: `Consecutive failures: ${health.consecutiveFailures}`,
+        },
+      });
+    }
+
+    if (client.shouldUseFallback()) {
+      const fallbackModel = client.getFallbackModelId();
+      if (fallbackModel) {
+        client.switchToFallback();
+        this.emit({
+          type: 'error',
+          data: {
+            level: 'warning',
+            message: `Switching to fallback model ${fallbackModel} after ${health.consecutiveFailures} consecutive failures`,
+            details: `Primary: ${client.getPrimaryModel()} → Fallback: ${fallbackModel}`,
+          },
+        });
+        this.logError('provider', `Auto-switched to fallback model: ${fallbackModel}`, undefined, `Failed ${health.consecutiveFailures}x with primary model`);
+      }
+    }
+  }
+
+  private async applyProviderBackoff(): Promise<void> {
+    const client = getProviderClient();
+    const health = client.getHealth();
+    if (health.consecutiveFailures > 0) {
+      const backoffMs = Math.min(30000, Math.pow(2, health.consecutiveFailures) * 1000);
+      this.emit({
+        type: 'status',
+        data: {
+          message: `Provider failed, backing off for ${Math.round(backoffMs / 1000)}s before retry...`,
+        },
+      });
+      await new Promise(resolve => setTimeout(resolve, backoffMs));
     }
   }
 }
