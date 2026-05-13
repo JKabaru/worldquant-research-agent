@@ -19,6 +19,8 @@ const SOURCE_PATHS = {
   expectedReturns: 'C:\\Users\\joseph\\Downloads\\Expected Returns PDF.pdf',
   computationalParadigms:
     'C:\\Users\\joseph\\Downloads\\Computational Paradigms in Systemat world quant.txt',
+  uniqueAlphas:
+    'C:\\Users\\joseph\\Downloads\\A Framework for Generating Unique Alphas from Foundational Research.txt',
 } as const;
 
 const DISTILLED_SNIPPETS: SourceSnippet[] = [
@@ -553,6 +555,89 @@ const DISTILLED_SNIPPETS: SourceSnippet[] = [
     text: 'High discretionary accruals coupled with sudden decline in order book depth signals institutional investors exiting ahead of negative earnings revision, combining fundamental and microstructure for predictive edge.',
     tags: ['accruals', 'microstructure', 'order_book', 'earnings'],
   },
+  // ============================================================
+  // A Framework for Generating Unique Alphas from Foundational Research
+  // ============================================================
+  {
+    id: 'ua_1',
+    sourceId: 'unique_alphas',
+    sourcePath: SOURCE_PATHS.uniqueAlphas,
+    topic: 'Hypothesis-first paradigm',
+    text: 'True value of 101 Formulaic Alphas lies in reverse-engineering underlying economic inefficiencies and behavioral mechanisms, not in copying expressions; knowledge base should be curated as hypothesis space, not expression repository; shift agent from copyist to researcher by prompting generate expression based on X hypothesis rather than generate expression similar to Y.',
+    tags: ['hypothesis_extraction', 'first_principles', 'economic_rationale'],
+  },
+  {
+    id: 'ua_2',
+    sourceId: 'unique_alphas',
+    sourcePath: SOURCE_PATHS.uniqueAlphas,
+    topic: 'Hypothesis space structure',
+    text: 'Each theme translates into structured hypothesis space: define core economic logic, required data fields, and operator primitives; structure allows LLM to understand why behind expression and generate new constructs using different operator or data combinations; example liquidity-momentum decomposes to core logic (trends persist with abnormal volume), fields (close, volume), primitives (correlation, rank).',
+    tags: ['hypothesis_space', 'structured_generation', 'combinatorial_creativity'],
+  },
+  {
+    id: 'ua_3',
+    sourceId: 'unique_alphas',
+    sourcePath: SOURCE_PATHS.uniqueAlphas,
+    topic: 'Semantic validation of expressions',
+    text: 'Validator should evaluate semantic plausibility not just syntax; adv20-close is rejected not because it violates grammar but because it combines fundamentally incompatible concepts (flow metric adv20 vs level metric close) without economic rationale; aim is to move from syntax parser to semantic plausibility reasoner that understands semantic domains of data fields.',
+    tags: ['semantic_validation', 'field_compatibility', 'plausibility'],
+  },
+  {
+    id: 'ua_4',
+    sourceId: 'unique_alphas',
+    sourcePath: SOURCE_PATHS.uniqueAlphas,
+    topic: 'Creativity triggers in prompts',
+    text: 'Instead of generic instructions use specific creativity triggers: Invert a common signals logic e.g. instead of high volume confirms trend, test low volume during trend as stronger continuation; Combine operators from different families e.g. apply ts_zscore to a signal created using group_rank and decay_linear; Apply temporal filter that activates only in specific volatility regimes.',
+    tags: ['creativity_triggers', 'prompt_challenges', 'novel_combinations'],
+  },
+  {
+    id: 'ua_5',
+    sourceId: 'unique_alphas',
+    sourcePath: SOURCE_PATHS.uniqueAlphas,
+    topic: 'Genetic diversity for alpha search',
+    text: 'Model alpha search after hierarchical genetic algorithms using quality-diversity selection; PCA-grid diversity enforcement ensures selected alphas spread across solution space; before acceptance calculate correlation of new alphas factor scores with all alphas in active baseline pool and reject or penalize any with max correlation above 0.3; seed with large diverse initial population.',
+    tags: ['genetic_diversity', 'quality_diversity', 'pca_grid', 'diversity_constraint'],
+  },
+  {
+    id: 'ua_6',
+    sourceId: 'unique_alphas',
+    sourcePath: SOURCE_PATHS.uniqueAlphas,
+    topic: 'Regime-aware prompting',
+    text: 'Prompt LLM to incorporate observable market states into alpha expression using if_else or trade_when; example: generate a momentum alpha but only if yield curve regime is normal positive slope produces if_else(ts_corr(yield_curve_slope, 10) > 0, rank(ts_zscore(close / ts_delay(close, 20))), 0); feedback loop should validate regime-specific performance not just raw performance.',
+    tags: ['regime_prompting', 'macro_adaptive', 'conditional_logic', 'yield_curve'],
+  },
+  {
+    id: 'ua_7',
+    sourceId: 'unique_alphas',
+    sourcePath: SOURCE_PATHS.uniqueAlphas,
+    topic: 'Regime-specific strategy mapping',
+    text: 'High Volatility or Low Liquidity (VIX > 25): employ low-vol factors, defensive tilts, mean-reversion; neutralize industry. Low Volatility or High Growth (VIX < 15, GDP > 2%): momentum, quality, carry alphas with higher risk tolerance; neutralize sub-industry. Rising Inflation or Tightening Policy (CPI > 3%, curve inversion): value, energy, commodities; neutralize GICS Sector. Stable Inflation or Growth (CPI 1-2%, flat curve): balanced quality-value-low-vol; neutralize NAICS Industry.',
+    tags: ['regime_strategy', 'volatility_regime', 'inflation_regime', 'macro_allocation'],
+  },
+  {
+    id: 'ua_8',
+    sourceId: 'unique_alphas',
+    sourcePath: SOURCE_PATHS.uniqueAlphas,
+    topic: 'IC statistical significance via p-value',
+    text: 'Move beyond treating IC as simple correlation; calculate p-value using t-statistic formula t = IC x sqrt(N - 2) where N is number of observations; reject any alpha with p-value above 0.05 to filter out spurious correlations lacking genuine predictive power; alpha with high IC but low statistical significance is just as dangerous as low IC.',
+    tags: ['ic_significance', 'p_value', 't_statistic', 'spurious_correlation'],
+  },
+  {
+    id: 'ua_9',
+    sourceId: 'unique_alphas',
+    sourcePath: SOURCE_PATHS.uniqueAlphas,
+    topic: 'PBO via CSCV for overfitting detection',
+    text: 'Probability of Backtest Overfitting via Combinatorially Symmetric Cross-Validation is the single most important metric for assessing whether alpha performance comes from genuine skill or curve-fitting; implement CSCV-based PBO as mandatory gatekeeper; reject any alpha with PBO above 0.1 regardless of in-sample Sharpe or IC; does not require vast historical data.',
+    tags: ['pbo', 'cscv', 'overfitting_detection', 'backtest_validity'],
+  },
+  {
+    id: 'ua_10',
+    sourceId: 'unique_alphas',
+    sourcePath: SOURCE_PATHS.uniqueAlphas,
+    topic: 'Parameter stability testing',
+    text: 'Check for over-optimization of lookback windows and parameters by perturbing key parameters plus or minus 10% and requiring Information Coefficient to drop by less than 20%; Stage 4 validation after performance thresholds and overfitting detection; ensures alpha performance is not fragile or dependent on exactly tuned inputs.',
+    tags: ['parameter_stability', 'perturbation_test', 'robustness_check'],
+  },
 ];
 
 function estimateTokens(text: string): number {
@@ -641,6 +726,7 @@ export function getConfiguredSourcePaths(): string[] {
     SOURCE_PATHS.activePortfolioManagement,
     SOURCE_PATHS.expectedReturns,
     SOURCE_PATHS.computationalParadigms,
+    SOURCE_PATHS.uniqueAlphas,
   ];
 }
 
