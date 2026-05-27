@@ -1,0 +1,18 @@
+0 verbose cli /usr/bin/node /usr/lib/node_modules/npm/bin/npm-cli.js
+1 info using npm@11.12.1
+2 info using node@v20.20.2
+3 silly config load:file:/usr/lib/node_modules/npm/npmrc
+4 silly config load:file:/mnt/e/Users/Public/wq-research-agent/.npmrc
+5 silly config load:file:/root/.npmrc
+6 silly config load:file:/usr/etc/npmrc
+7 verbose title npm exec next dev -p 3012
+8 verbose argv "exec" "--" "next" "dev" "-p" "3012"
+9 verbose logfile logs-max:10 dir:/mnt/e/Users/Public/wq-research-agent/.npm-cache/_logs/2026-05-27T11_56_26_497Z-
+10 verbose logfile /mnt/e/Users/Public/wq-research-agent/.npm-cache/_logs/2026-05-27T11_56_26_497Z-debug-0.log
+11 silly logfile done cleaning log files
+12 verbose cwd /mnt/e/Users/Public/wq-research-agent
+13 verbose os Linux 6.6.114.1-microsoft-standard-WSL2
+14 verbose node v20.20.2
+15 verbose npm  v11.12.1
+16 verbose exit 0
+17 info ok

@@ -17,6 +17,7 @@ import { DiversityManager } from './diversity';
 import {
   ALPHA_QUALITY_THRESHOLDS,
   STYLE_PREMIA_CONFIG,
+  CORRELATION_BASELINE_CONFIG,
 } from './constants';
 import { getDatabase, type DatabaseStats } from './persistence/database';
 import { getDataWarehouse } from './persistence/data-warehouse';
@@ -1118,6 +1119,66 @@ export class ResearchEngine {
         this.acceptAlpha(candidate, alpha);
         return result;
       }
+    }
+
+    // Gap 7: Negative Sharpe Inversion
+    // If sharpe is strongly negative but |sharpe| >= minSharpe and other metrics are sound,
+    // wrap expression with -(expr) and queue for re-simulation via the polish pipeline.
+    // This recovers high-magnitude signals that are directionally inverted.
+    if (alpha.sharpe < 0 &&
+        Math.abs(alpha.sharpe) >= thresholds.minSharpe &&
+        alpha.fitness >= thresholds.minFitness * 0.85 &&
+        alpha.turnover <= thresholds.maxTurnover &&
+        !alpha.checks.some(c => c.result === 'FAIL')) {
+
+      const invertedExpr = `-(${candidate.expression})`;
+
+      const invertedCandidate: AlphaCandidate = {
+        id: uuidv4(),
+        expression: invertedExpr,
+        parentId: candidate.id,
+        generation: candidate.generation,
+        strategy: `${candidate.strategy}_inverted`,
+        diversityScore: 0,
+        fingerprint: this.validator.generateFingerprint(invertedExpr),
+        status: 'pending',
+        isInverted: true,
+        originalExpression: candidate.expression,
+        originalSharpe: alpha.sharpe,
+        createdAt: new Date().toISOString(),
+      };
+
+      this.state.polishQueue.push(invertedCandidate);
+
+      this.addFeedback(
+        'middle',
+        candidate.id,
+        `Sharpe=${alpha.sharpe.toFixed(3)} negative but magnitude ${Math.abs(alpha.sharpe).toFixed(3)} >= ${thresholds.minSharpe}. Inverted expression queued for re-simulation.`,
+        'inverted',
+        `Inverted: ${invertedExpr}`
+      );
+
+      this.logTrace('inversion_queued', 'Negative Sharpe inversion queued for re-simulation', candidate.id, {
+        originalSharpe: alpha.sharpe,
+        invertedExpression: invertedExpr,
+      });
+
+      // Mark original as discarded (not failed — inverted version continues through pipeline)
+      candidate.status = 'discarded';
+      candidate.error = `Sharpe ${alpha.sharpe.toFixed(3)} inverted — re-queued as ${invertedExpr}`;
+      this.state.candidateQueue.push(candidate);
+
+      // Emit event for UI visibility
+      this.emit({
+        type: 'critique_resubmit',
+        data: {
+          candidateId: invertedCandidate.id,
+          parentId: candidate.id,
+          expression: invertedExpr,
+        },
+      });
+
+      return result;
     }
 
     // Needs polishing
@@ -2792,33 +2853,60 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
     */
    private async refreshCorrelationBaseline(): Promise<void> {
      try {
-       const wqClient = getWQClient();
-       const submittedResult = await wqClient.listUserAlphas({
-         limit: 100,
-         status: 'ACTIVE',
-       });
-       if (submittedResult.results.length > 0) {
-         await this.diversityManager.loadSubmittedAlphaCorrelations(submittedResult.results);
+       const alphas = await this.fetchAllActiveAlphas();
+       if (alphas.length > 0) {
+         await this.diversityManager.loadSubmittedAlphaCorrelations(alphas);
        }
      } catch {
        // Non-fatal: if refresh fails, continue with existing baseline
      }
    }
 
+   /**
+    * Fetch all ACTIVE submitted alphas with pagination.
+    * Provides a complete correlation baseline so pre-sim checks don't miss older alphas.
+    * Caps at CORRELATION_BASELINE_CONFIG.maxAlphas (default 500).
+    */
+   private async fetchAllActiveAlphas(
+     maxAlphas = CORRELATION_BASELINE_CONFIG.maxAlphas,
+     batchSize = CORRELATION_BASELINE_CONFIG.batchSize,
+   ): Promise<WQAlpha[]> {
+     const wqClient = getWQClient();
+     const allAlphas: WQAlpha[] = [];
+     let offset = 0;
+
+     while (allAlphas.length < maxAlphas) {
+       const remaining = maxAlphas - allAlphas.length;
+       const limit = Math.min(batchSize, remaining);
+
+       let result;
+       try {
+         result = await wqClient.listUserAlphas({ limit, offset, status: 'ACTIVE' });
+       } catch {
+         break; // stop paginating on API error
+       }
+
+       if (!result || !result.results || result.results.length === 0) break;
+       allAlphas.push(...result.results);
+       offset += result.results.length;
+
+       // If fewer results than requested, we've hit the end
+       if (result.results.length < limit) break;
+     }
+
+     return allAlphas;
+   }
+
    private async loadExistingAlphas(): Promise<void> {
     try {
-      const wqClient = getWQClient();
       // Keep in-session living library separate from user submitted alphas to avoid
       // prompt/evolution leakage from production portfolio formulas.
       this.state.livingAlphas = [];
 
       // Gap 3: Also load submitted alphas specifically for correlation baseline
-      const submittedResult = await wqClient.listUserAlphas({
-        limit: 100,
-        status: 'ACTIVE',
-      });
-      if (submittedResult.results.length > 0) {
-        await this.diversityManager.loadSubmittedAlphaCorrelations(submittedResult.results);
+      const submittedAlphas = await this.fetchAllActiveAlphas();
+      if (submittedAlphas.length > 0) {
+        await this.diversityManager.loadSubmittedAlphaCorrelations(submittedAlphas);
       }
 
       this.state.diversityMetrics = this.diversityManager.getMetrics();

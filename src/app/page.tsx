@@ -142,20 +142,43 @@ interface DiversityMetrics {
   styleDistribution: Record<string, number>;
 }
 
+// Simulation settings config — fetched dynamically from API
+interface SimSettings {
+  version: number;
+  updatedAt: string;
+  regions: Array<{ value: string; label: string; universes: string[] }>;
+  neutralizations: string[];
+  defaults: {
+    region: string;
+    universe: string;
+    delay: number;
+    decay: number;
+    neutralization: string;
+    truncation: number;
+    instrumentType: string;
+    pasteurization: string;
+    unitHandling: string;
+    nanHandling: string;
+    maxTrade: string;
+    language: string;
+    testPeriod: string;
+  };
+}
+
 // ============================================================
 // Constants
 // ============================================================
 
 const REGIONS = [
-  { value: 'USA', universes: ['TOP3000', 'TOP1000', 'TOP500', 'TOP200'] },
-  { value: 'GLB', universes: ['TOP3000', 'MINVOL1M', 'TOPDIV3000'] },
-  { value: 'EUR', universes: ['TOP2500', 'TOP1200', 'TOP800', 'TOP400'] },
-  { value: 'ASI', universes: ['MINVOL1M'] },
-  { value: 'CHN', universes: ['TOP2000U'] },
-  { value: 'IND', universes: ['TOP500'] },
+  { value: 'USA', label: 'USA', universes: ['TOP3000', 'TOP2000', 'TOP1000', 'TOP500', 'TOP200', 'TOPSP500'] },
+  { value: 'GLB', label: 'Global', universes: ['TOP3000', 'MINVOL1M', 'TOPDIV3000'] },
+  { value: 'EUR', label: 'Europe', universes: ['TOP2500', 'TOP1200', 'TOP800', 'TOP400'] },
+  { value: 'ASI', label: 'Asia', universes: ['MINVOL1M'] },
+  { value: 'CHN', label: 'China', universes: ['TOP2000U'] },
+  { value: 'IND', label: 'India', universes: ['TOP500'] },
 ];
 
-const NEUTRALIZATIONS = ['MARKET', 'SECTOR', 'INDUSTRY', 'SUBINDUSTRY', 'COUNTRY'];
+const NEUTRALIZATIONS = ['MARKET', 'SECTOR', 'INDUSTRY', 'SUBINDUSTRY', 'COUNTRY', 'REVERSION_AND_MOMENTUM', 'STATISTICAL', 'CROWDING', 'FAST', 'SLOW', 'SLOW_AND_FAST'];
 
 // ============================================================
 // Main Application Component
@@ -196,6 +219,10 @@ export default function Home() {
   const [alphas, setAlphas] = useState<Alpha[]>([]);
   const [alphasLoading, setAlphasLoading] = useState(false);
   const [alphaFilter, setAlphaFilter] = useState('all');
+
+  // Dynamic simulation settings config (regions, neutralizations, defaults)
+  const [simSettings, setSimSettings] = useState<SimSettings | null>(null);
+  const [simSettingsDirty, setSimSettingsDirty] = useState(false);
 
   // Research state
   const [researchStatus, setResearchStatus] = useState<ResearchStatus | null>(null);
@@ -293,6 +320,7 @@ export default function Home() {
     fetchProviders();
     checkWQAuth();
     void pollResearchStatus();
+    void fetchSimSettings();
 
     const eventSource = new EventSource('/api/events');
     const refreshTypes = new Set([
@@ -370,6 +398,20 @@ export default function Home() {
       }
     } catch {
       addLog('error', 'Failed to fetch providers');
+    }
+  };
+
+  const fetchSimSettings = async () => {
+    try {
+      const res = await fetch('/api/settings');
+      const data = await res.json();
+      if (data.error) {
+        addLog('error', `Sim settings: ${data.error}`);
+        return;
+      }
+      setSimSettings(data);
+    } catch {
+      addLog('error', 'Failed to fetch simulation settings');
     }
   };
 
@@ -1185,16 +1227,17 @@ export default function Home() {
                 <div>
                   <label className="block text-xs text-gray-400 mb-1">Region</label>
                   <select className="select" value={config.region} onChange={e => {
-                    const region = REGIONS.find(r => r.value === e.target.value);
+                    const regions = simSettings?.regions || REGIONS;
+                    const region = regions.find(r => r.value === e.target.value);
                     setConfig({ ...config, region: e.target.value, universe: region?.universes[0] || 'TOP3000' });
                   }}>
-                    {REGIONS.map(r => <option key={r.value} value={r.value}>{r.value}</option>)}
+                    {(simSettings?.regions || REGIONS).map(r => <option key={r.value} value={r.value}>{r.label || r.value}</option>)}
                   </select>
                 </div>
                 <div>
                   <label className="block text-xs text-gray-400 mb-1">Universe</label>
                   <select className="select" value={config.universe} onChange={e => setConfig({ ...config, universe: e.target.value })}>
-                    {REGIONS.find(r => r.value === config.region)?.universes.map(u => (
+                    {(simSettings?.regions || REGIONS).find(r => r.value === config.region)?.universes.map(u => (
                       <option key={u} value={u}>{u}</option>
                     ))}
                   </select>
@@ -1209,7 +1252,7 @@ export default function Home() {
                 <div>
                   <label className="block text-xs text-gray-400 mb-1">Neutralization</label>
                   <select className="select" value={config.neutralization} onChange={e => setConfig({ ...config, neutralization: e.target.value })}>
-                    {NEUTRALIZATIONS.map(n => <option key={n} value={n}>{n}</option>)}
+                    {(simSettings?.neutralizations || NEUTRALIZATIONS).map(n => <option key={n} value={n}>{n}</option>)}
                   </select>
                 </div>
                 <div>
@@ -1740,6 +1783,117 @@ export default function Home() {
                   Refresh Stats
                 </button>
               </div>
+            </div>
+
+            {/* Dynamic Simulation Settings Admin */}
+            <div className="card">
+              <h3 className="text-sm font-semibold mb-2 flex items-center gap-2">
+                <span className="text-purple-400">&#9881;</span> Simulation Settings Config
+                {simSettings && (
+                  <span className="text-xs font-normal text-gray-500 ml-auto">
+                    v{simSettings.version} &middot; {simSettings.updatedAt ? new Date(simSettings.updatedAt).toLocaleDateString() : 'today'}
+                  </span>
+                )}
+              </h3>
+              <p className="text-xs text-gray-400 mb-3">
+                Manage region/universe/neutralization options available in the Research tab.
+                <br />
+                <span className="text-yellow-400/70">Edits apply immediately &mdash; no restart needed.</span>
+              </p>
+
+              {simSettings ? (
+                <div className="space-y-3">
+                  <details className="group">
+                    <summary className="text-sm font-medium text-gray-300 cursor-pointer hover:text-white select-none">
+                      Current Config (click to expand)
+                    </summary>
+                    <div className="mt-2">
+                      <textarea
+                        className="input font-mono text-xs w-full h-64"
+                        value={JSON.stringify(simSettings, null, 2)}
+                        onChange={e => {
+                          try {
+                            const parsed = JSON.parse(e.target.value);
+                            setSimSettings(parsed);
+                            setSimSettingsDirty(true);
+                          } catch {
+                            // Allow invalid JSON while editing
+                            setSimSettingsDirty(true);
+                          }
+                        }}
+                      />
+                      <div className="flex gap-2 mt-2">
+                        <button
+                          className="btn btn-sm btn-primary"
+                          onClick={async () => {
+                            try {
+                              const res = await fetch('/api/settings', {
+                                method: 'PUT',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(simSettings),
+                              });
+                              const data = await res.json();
+                              if (data.error) {
+                                addLog('error', `Failed to save: ${data.error}`);
+                              } else {
+                                setSimSettings(data);
+                                setSimSettingsDirty(false);
+                                addLog('success', `Simulation settings saved (v${data.version})`);
+                              }
+                            } catch {
+                              addLog('error', 'Network error saving settings');
+                            }
+                          }}
+                          disabled={!simSettingsDirty}
+                        >
+                          Save Changes
+                        </button>
+                        <button
+                          className="btn btn-sm btn-secondary"
+                          onClick={async () => {
+                            await fetchSimSettings();
+                            setSimSettingsDirty(false);
+                          }}
+                        >
+                          Reset
+                        </button>
+                        {simSettingsDirty && (
+                          <span className="text-xs text-yellow-400 self-center">
+                            Unsaved changes
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </details>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                    <div>
+                      <span className="text-gray-500">Regions:</span>
+                      <span className="text-gray-300 ml-1">{simSettings.regions?.length || 0}</span>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">Neutralizations:</span>
+                      <span className="text-gray-300 ml-1">{simSettings.neutralizations?.length || 0}</span>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">Default region:</span>
+                      <span className="text-gray-300 ml-1 font-mono">{simSettings.defaults?.region || '-'}</span>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">Default neutralization:</span>
+                      <span className="text-gray-300 ml-1 font-mono">{simSettings.defaults?.neutralization || '-'}</span>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 text-xs text-gray-500">
+                  <span className="w-3 h-3 rounded-full bg-yellow-400/50 animate-pulse" />
+                  Loading config...
+                  <button className="btn btn-sm btn-secondary ml-2" onClick={fetchSimSettings}>
+                    Retry
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         )}

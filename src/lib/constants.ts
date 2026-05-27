@@ -44,7 +44,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 ];
 
 export const WQ_REGIONS = [
-  { value: 'USA', label: 'USA', universes: ['TOP3000', 'TOP1000', 'TOP500', 'TOP200'] },
+  { value: 'USA', label: 'USA', universes: ['TOP3000', 'TOP2000', 'TOP1000', 'TOP500', 'TOP200', 'TOPSP500'] },
   { value: 'GLB', label: 'Global', universes: ['TOP3000', 'MINVOL1M', 'TOPDIV3000'] },
   { value: 'EUR', label: 'Europe', universes: ['TOP2500', 'TOP1200', 'TOP800', 'TOP400'] },
   { value: 'ASI', label: 'Asia', universes: ['MINVOL1M'] },
@@ -83,6 +83,14 @@ export const ALPHA_QUALITY_THRESHOLDS = {
   minTurnover: 0.01,
   minPositions: 100,
   minMargin: -1.6,
+};
+
+// Gap 8b: Correlation baseline pagination config
+// Controls how many submitted alphas are loaded for pre-simulation correlation checks.
+// Larger = stricter correlation gate (less leakage) but more API calls on startup.
+export const CORRELATION_BASELINE_CONFIG = {
+  maxAlphas: 500,
+  batchSize: 250,
 };
 
 export const STYLE_PREMIA_CONFIG = {

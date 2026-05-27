@@ -600,6 +600,14 @@ export class AlphaDatabase {
         model_id TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+      
+      -- Simulation Settings Config: persistent simulation config with region/universe/neutralization options
+      CREATE TABLE IF NOT EXISTS simulation_config (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        version INTEGER NOT NULL DEFAULT 1,
+        config_json TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
     `);
   }
 
@@ -1334,6 +1342,32 @@ export class AlphaDatabase {
 
   vacuum(): void {
     this.db.exec('PRAGMA incremental_vacuum');
+  }
+
+  // ============================================================
+  // Simulation Settings Config — persisted simulation options
+  // ============================================================
+
+  getSimulationConfig(): { version: number; config_json: string; updated_at: string } | null {
+    try {
+      const row = this.db.prepare(
+        'SELECT version, config_json, updated_at FROM simulation_config WHERE id = 1'
+      ).get() as { version: number; config_json: string; updated_at: string } | undefined;
+      return row || null;
+    } catch {
+      return null;
+    }
+  }
+
+  saveSimulationConfig(configJson: string, version = 1): void {
+    this.db.prepare(`
+      INSERT INTO simulation_config (id, version, config_json, updated_at)
+      VALUES (1, ?, ?, datetime('now'))
+      ON CONFLICT(id) DO UPDATE SET
+        version = excluded.version,
+        config_json = excluded.config_json,
+        updated_at = excluded.updated_at
+    `).run(version, configJson);
   }
 
   checkpoint(): void {

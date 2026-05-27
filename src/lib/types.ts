@@ -255,6 +255,14 @@ export interface AlphaCandidate {
   result?: WQAlpha;
   error?: string;
   createdAt: string;
+
+  // Negative Sharpe Inversion tracking
+  // When true, this candidate is a negated copy of an original that had negative Sharpe
+  isInverted?: boolean;
+  // The original expression before inversion (for traceability/audit)
+  originalExpression?: string;
+  // The original Sharpe ratio before inversion
+  originalSharpe?: number;
 }
 
 export interface SimulationRecord {
@@ -417,5 +425,33 @@ export interface LossComponents {
     fitness: number;
     turnover: number;
     correlation: number;
+  };
+}
+
+// --- Dynamic Simulation Settings Config ---
+
+export interface SimulationSettingsConfig {
+  version: number;
+  updatedAt: string;
+  regions: Array<{
+    value: string;
+    label: string;
+    universes: string[];
+  }>;
+  neutralizations: string[];
+  defaults: {
+    region: string;
+    universe: string;
+    delay: number;
+    decay: number;
+    neutralization: string;
+    truncation: number;
+    instrumentType: 'EQUITY';
+    pasteurization: 'ON' | 'OFF';
+    unitHandling: 'VERIFY' | 'IGNORE';
+    nanHandling: 'OFF' | 'ON';
+    maxTrade: 'OFF' | string;
+    language: 'FASTEXPR';
+    testPeriod: string;
   };
 }
