@@ -2320,6 +2320,8 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
   private addToExperienceBuffer(candidate: AlphaCandidate, alpha: WQAlpha): void {
     // Compute novelty score by comparing expression to existing hypotheses in source memory
     const noveltyScore = this.computeExperienceNovelty(candidate.expression);
+    // Get the most recent correction from feedback history
+    const recentCorrection = this.state.feedbackHistory.at(-1) ? { result: this.state.feedbackHistory.at(-1)!.result } : undefined;
     
     // Compute learning value based on improvement magnitude and strategy
     const learningValue = this.computeExperienceLearningValue(alpha, candidate, recentCorrection);
