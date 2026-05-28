@@ -467,10 +467,11 @@ export class DiversityManager {
     const portfolioDiversity = this.computeAggregateCoverage();
 
     const baseThreshold = this.maxCorrelation;
-    const diversityBonus = Math.min(0.15, (totalFingerprints / 100) * 0.05);
+    // Threshold gets STRICTER (lower) as portfolio grows — not looser
+    const diversityPenalty = Math.min(0.10, (totalFingerprints / 100) * 0.02);
     const penalty = portfolioDiversity > 0.5 ? 0.05 : 0;
 
-    return Math.max(0.25, Math.min(0.5, baseThreshold - penalty + diversityBonus));
+    return Math.max(0.25, Math.min(0.4, baseThreshold - penalty - diversityPenalty));
   }
 
   /**

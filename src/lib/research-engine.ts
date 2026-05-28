@@ -9,6 +9,7 @@ import {
   ResearchError, FeedbackRecord, ExperienceTuple, LineageNode,
   GenerationStats, WQAlpha, WQSimulationResult, LossComponents,
   InnerLoopResult, MiddleLoopResult, OuterLoopResult, StylePremia, MacroRegime, RewardBreakdown,
+  SyntaxErrorEntry,
 } from './types';
 import { getAllProviders, getProvider, getProviderClient } from './provider';
 import { getWQClient } from './wq-client';
@@ -143,6 +144,7 @@ export class ResearchEngine {
       // Current processing state (exposed for UI display)
       currentHypothesis: null,
       currentExpression: null,
+      syntaxErrorBuffer: [],
     };
   }
 
@@ -757,34 +759,31 @@ export class ResearchEngine {
         validCandidates.push(candidate);
       }
 
-      // Submit simulations in concurrent batches respecting maxConcurrentSimulations
+      // Submit simulations using a worker pool that always keeps maxConcurrentSimulations slots filled.
+      // WQ only allows 3 concurrent sims — this avoids the 4th being blocked (not rejected).
       const concurrencyLimit = config.maxConcurrentSimulations || 3;
-      for (let i = 0; i < validCandidates.length; i += concurrencyLimit) {
-        if (this.abortController?.signal.aborted || this.state.status !== 'running') break;
+      let simIndex = 0;
 
-        const batch = validCandidates.slice(i, i + concurrencyLimit);
+      const simWorker = async (): Promise<void> => {
+        while (this.state.status === 'running' && !this.abortController?.signal.aborted) {
+          const idx = simIndex++;
+          if (idx >= validCandidates.length) break;
 
-        // Stagger submissions within a batch by 2 seconds each
-        const submitPromises = batch.map((candidate, idx) =>
-          new Promise<{ candidate: AlphaCandidate; result: WQSimulationResult | null }>((resolve) => {
-            const timeoutId = setTimeout(async () => {
-              this.pendingTimeouts.delete(timeoutId);
-              if (this.abortController?.signal.aborted || this.state.status !== 'running') {
-                resolve({ candidate, result: null });
-                return;
-              }
-              const result = await this.submitSimulation(candidate);
-              resolve({ candidate, result });
-            }, idx * 2000); // 2-second stagger within batch
-            this.pendingTimeouts.add(timeoutId);
-          })
-        );
+          // 1-second stagger between submissions from the same worker
+          await this.rateLimit(1000);
 
-        const batchResults = await Promise.allSettled(submitPromises);
+          if (this.abortController?.signal.aborted || this.state.status !== 'running') break;
 
-        for (const settled of batchResults) {
-          if (settled.status !== 'fulfilled') continue;
-          const { candidate, result } = settled.value;
+          let result: WQSimulationResult | null = null;
+          try {
+            result = await this.submitSimulation(validCandidates[idx]);
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            this.logError('simulator', 'Simulation worker crashed', validCandidates[idx].expression, msg);
+            continue;
+          }
+
+          const candidate = validCandidates[idx];
 
           if (!result || result.status === 'FAILED' || result.status === 'ERROR') {
             this.handleSimulationFailure(candidate, result);
@@ -840,7 +839,22 @@ export class ResearchEngine {
             this.trackLineage(candidate, result.alpha);
           }
         }
+      };
+
+      // Start worker pool — each worker immediately picks up the next unprocessed candidate
+      const workerCount = Math.min(concurrencyLimit, validCandidates.length);
+      const workerPromises: Promise<void>[] = [];
+      for (let i = 0; i < workerCount; i++) {
+        workerPromises.push(new Promise<void>(resolve => {
+          const timeoutId = setTimeout(async () => {
+            this.pendingTimeouts.delete(timeoutId);
+            await simWorker();
+            resolve();
+          }, i * 1000); // Stagger worker starts by 1s to avoid thundering herd
+          this.pendingTimeouts.add(timeoutId);
+        }));
       }
+      await Promise.allSettled(workerPromises);
 
       // Record generation stats
       const genStats: GenerationStats = {
@@ -998,6 +1012,17 @@ export class ResearchEngine {
       } catch { /* non-fatal */ }
     }
 
+    // Store validation error in syntax error buffer for LLM feedback
+    this.state.syntaxErrorBuffer.push({
+      expression: candidate.expression,
+      error: result.errors.join('; '),
+      errorCategory: 'validation',
+      timestamp: new Date().toISOString(),
+    });
+    if (this.state.syntaxErrorBuffer.length > 50) {
+      this.state.syntaxErrorBuffer = this.state.syntaxErrorBuffer.slice(-25);
+    }
+
     // Attempt auto-correction via LLM
     if (this.state.config?.enableAutoCorrection) {
       this.autoCorrectExpression(candidate, result.errors).catch(() => {});
@@ -1020,13 +1045,30 @@ export class ResearchEngine {
       } catch { /* non-fatal */ }
     }
 
-    // If simulation error contains unknown operator, add to inaccessible list
-    if (simResult?.error) {
-      const inaccesibleMatch = simResult.error.match(/unknown (?:function|operator) ["'](\w+)["']/i);
+    // Store structured syntax error for LLM feedback
+    const errorMsg = simResult?.error || '';
+    let errorCategory: SyntaxErrorEntry['errorCategory'] = 'simulation';
+    let operator: string | undefined;
+
+    if (errorMsg) {
+      const inaccesibleMatch = errorMsg.match(/unknown (?:function|operator) ["'](\w+)["']/i);
       if (inaccesibleMatch) {
+        operator = inaccesibleMatch[1];
+        errorCategory = 'operator';
         this.validator.addInaccessibleOp(inaccesibleMatch[1]);
         this.addFeedback('inner', candidate.id, `Marked operator as inaccessible: ${inaccesibleMatch[1]}`, 'learning', 'inaccessible');
       }
+    }
+
+    this.state.syntaxErrorBuffer.push({
+      expression: candidate.expression,
+      error: errorMsg,
+      errorCategory,
+      operator,
+      timestamp: new Date().toISOString(),
+    });
+    if (this.state.syntaxErrorBuffer.length > 50) {
+      this.state.syntaxErrorBuffer = this.state.syntaxErrorBuffer.slice(-25);
     }
   }
 
@@ -1118,6 +1160,34 @@ export class ResearchEngine {
         this.acceptAlpha(candidate, alpha);
         return result;
       }
+    }
+
+    // Negative Sharpe inversion: if |Sharpe| >= minSharpe, invert expression and re-simulate
+    if (alpha.sharpe <= -thresholds.minSharpe) {
+      const invertedExpr = `-1 * (${candidate.expression})`;
+      this.state.polishQueue.push({
+        id: uuidv4(),
+        expression: invertedExpr,
+        parentId: candidate.id,
+        generation: this.state.currentGeneration,
+        strategy: candidate.strategy,
+        diversityScore: 0,
+        fingerprint: this.validator.generateFingerprint(invertedExpr),
+        status: 'pending' as const,
+        createdAt: new Date().toISOString(),
+      });
+      this.logTrace('sharpe_inverted', 'Negative Sharpe inverted and queued for re-simulation', candidate.id, {
+        originalSharpe: alpha.sharpe,
+        invertedExpression: invertedExpr,
+      });
+      this.addFeedback('middle', candidate.id,
+        `Negative Sharpe ${alpha.sharpe.toFixed(3)} inverted to positive — ${invertedExpr} queued for re-simulation`,
+        'inverted', `Sharpe ${alpha.sharpe.toFixed(3)} → invert`);
+
+      candidate.status = 'failed';
+      candidate.error = `Negative Sharpe inverted: ${alpha.sharpe.toFixed(3)} → queued as ${invertedExpr}`;
+      this.state.candidateQueue.push(candidate);
+      return result;
     }
 
     // Needs polishing
@@ -1445,21 +1515,28 @@ Each hypothesis should be 1-2 sentences of plain English.`;
        prompt += '\n\n';
      }
 
-     // Correlation feedback — show rejected operator/field patterns to avoid
-     const correlationContext = this.diversityManager.getCorrelationSummary();
-     if (correlationContext) {
-       prompt += correlationContext;
-       prompt += '\n';
-       prompt += 'Note: These patterns were correlated with existing portfolio. Explore different data domains or operator combinations.\n\n';
-     }
+      // Correlation feedback — show rejected operator/field patterns to avoid
+      const correlationContext = this.diversityManager.getCorrelationSummary();
+      if (correlationContext) {
+        prompt += correlationContext;
+        prompt += '\n';
+        prompt += 'Note: These patterns were correlated with existing portfolio. Explore different data domains or operator combinations.\n\n';
+      }
 
-     prompt += `Strategy: ${outerResult.strategy} | Mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%\n`;
-     prompt += this.buildSourceGuidanceBlock(
-      `hypothesis generation ${style} ${outerResult.strategy} ${styleConfig.datasets.join(' ')}`
-     );
-     prompt += `Generate ${count} diverse, testable investment hypotheses.`;
-    return prompt;
-  }
+      // Syntax error feedback — help the model learn from past mistakes
+      const syntaxContext = this.getSyntaxErrorSummary();
+      if (syntaxContext) {
+        prompt += syntaxContext;
+        prompt += '\n';
+      }
+
+      prompt += `Strategy: ${outerResult.strategy} | Mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%\n`;
+      prompt += this.buildSourceGuidanceBlock(
+       `hypothesis generation ${style} ${outerResult.strategy} ${styleConfig.datasets.join(' ')}`
+      );
+      prompt += `Generate ${count} diverse, testable investment hypotheses.`;
+     return prompt;
+   }
 
   /**
    * Gap 1: Code Specialist Agent
@@ -1556,21 +1633,28 @@ Each hypothesis should be 1-2 sentences of plain English.`;
        prompt += '\n\n';
      }
 
-     // Correlation feedback — rolling summary
-     const correlationContext = this.diversityManager.getCorrelationSummary();
-     if (correlationContext) {
-       prompt += correlationContext;
-       prompt += '\n';
-       prompt += 'Note: These operator+field patterns were rejected due to portfolio correlation. Diversify by using different operators, fields, or neutralization methods.\n\n';
-     }
+      // Correlation feedback — rolling summary
+      const correlationContext = this.diversityManager.getCorrelationSummary();
+      if (correlationContext) {
+        prompt += correlationContext;
+        prompt += '\n';
+        prompt += 'Note: These operator+field patterns were rejected due to portfolio correlation. Diversify by using different operators, fields, or neutralization methods.\n\n';
+      }
 
-     prompt += `Translate each hypothesis into a complete FASTEXPR expression. Use ${styleConfig.datasets.join(', ')} data.\n`;
-     prompt += `Strategy: ${outerResult.strategy} | Mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%\n`;
-     prompt += this.buildSourceGuidanceBlock(
-      `code translation ${style} ${outerResult.strategy} ${styleConfig.operators.join(' ')} ${hypotheses.join(' ')}`
-     );
-     return prompt;
-  }
+      // Syntax error feedback — help the model learn from past expression failures
+      const syntaxContext = this.getSyntaxErrorSummary();
+      if (syntaxContext) {
+        prompt += syntaxContext;
+        prompt += '\n';
+      }
+
+      prompt += `Translate each hypothesis into a complete FASTEXPR expression. Use ${styleConfig.datasets.join(', ')} data.\n`;
+      prompt += `Strategy: ${outerResult.strategy} | Mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%\n`;
+      prompt += this.buildSourceGuidanceBlock(
+       `code translation ${style} ${outerResult.strategy} ${styleConfig.operators.join(' ')} ${hypotheses.join(' ')}`
+      );
+      return prompt;
+   }
 
   /**
    * Gap 1: Legacy fallback for direct generation (used when hypothesis generation fails)
@@ -1692,15 +1776,22 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
        prompt += '\n\n';
      }
 
-     // Include correlation feedback (rolling summary of recent rejections)
-     const correlationContext = this.diversityManager.getCorrelationSummary();
-     if (correlationContext) {
-       prompt += correlationContext;
-       prompt += '\n';
-       prompt += 'Note: These patterns correlated with existing portfolio. Find alternative operators, data fields, or neutralization approaches.\n\n';
-     }
+      // Include correlation feedback (rolling summary of recent rejections)
+      const correlationContext = this.diversityManager.getCorrelationSummary();
+      if (correlationContext) {
+        prompt += correlationContext;
+        prompt += '\n';
+        prompt += 'Note: These patterns correlated with existing portfolio. Find alternative operators, data fields, or neutralization approaches.\n\n';
+      }
 
-     prompt += `## Strategy: ${outerResult.strategy} (mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%)\n\n`;
+      // Include syntax error feedback for the model to learn from
+      const syntaxContext = this.getSyntaxErrorSummary();
+      if (syntaxContext) {
+        prompt += syntaxContext;
+        prompt += '\n';
+      }
+
+      prompt += `## Strategy: ${outerResult.strategy} (mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%)\n\n`;
      prompt += this.buildSourceGuidanceBlock(
       `expression generation ${style} ${outerResult.strategy} ${styleConfig.datasets.join(' ')} ${styleConfig.operators.join(' ')}`
      );
@@ -2844,6 +2935,31 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
       this.simulationCounter = { count: 0, date: today };
     }
     return this.simulationCounter.count < maxDaily;
+  }
+
+  /**
+   * Return a structured summary of recent syntax errors for LLM prompts.
+   * Helps the model learn from its mistakes (unknown operators, structural issues, etc.)
+   */
+  private getSyntaxErrorSummary(): string {
+    if (this.state.syntaxErrorBuffer.length === 0) return '';
+
+    const recent = this.state.syntaxErrorBuffer.slice(-5);
+    const lines = recent.map(e => {
+      if (e.errorCategory === 'operator' && e.operator) {
+        return `- Unknown operator "${e.operator}" in expression. This operator is not available at current permission level.`;
+      }
+      if (e.errorCategory === 'validation') {
+        return `- Validation error: ${e.error}`;
+      }
+      if (e.errorCategory === 'simulation') {
+        const short = e.error.length > 100 ? e.error.substring(0, 100) + '...' : e.error;
+        return `- Simulation error: ${short}`;
+      }
+      return `- Error: ${e.error}`;
+    });
+
+    return `\n## Recent Syntax Errors (learn from these):\n${lines.join('\n')}\nAvoid repeating the same mistakes.\n`;
   }
 
   private rateLimit(ms: number): Promise<void> {

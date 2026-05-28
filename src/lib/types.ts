@@ -206,6 +206,14 @@ export interface ResearchConfig {
   generationMultiplier?: number;
 }
 
+export interface SyntaxErrorEntry {
+  expression: string;
+  error: string;
+  errorCategory: 'validation' | 'simulation' | 'operator' | 'unknown';
+  operator?: string;
+  timestamp: string;
+}
+
 export interface ResearchState {
   id: string;
   status: 'idle' | 'running' | 'paused' | 'stopping' | 'error';
@@ -240,6 +248,8 @@ export interface ResearchState {
   // Current processing state (exposed for UI display)
   currentHypothesis: string | null;
   currentExpression: string | null;
+  // Structured syntax error history for LLM feedback
+  syntaxErrorBuffer: SyntaxErrorEntry[];
 }
 
 export interface AlphaCandidate {

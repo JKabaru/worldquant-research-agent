@@ -1618,14 +1618,14 @@ export default function Home() {
                   {persistenceStats?.sqlite && (
                     <div className="space-y-2">
                       {[
-                        { label: 'Alpha Fingerprints', value: persistenceStats.sqlite.fingerprints },
-                        { label: 'Experience Replay (TD-priority)', value: persistenceStats.sqlite.experienceReplay },
-                        { label: 'Simulation Logs', value: persistenceStats.sqlite.simulationLogs },
-                        { label: 'Lineage Tree Nodes', value: persistenceStats.sqlite.lineage },
-                        { label: 'Generation Stats', value: persistenceStats.sqlite.generationStats },
-                        { label: 'Error Logs', value: persistenceStats.sqlite.errorLogs },
-                        { label: 'Feedback Entries', value: persistenceStats.sqlite.feedbackEntries },
-                        { label: 'Research Sessions', value: persistenceStats.sqlite.researchSessions },
+                        { label: 'Alpha Fingerprints', value: persistenceStats.sqlite.fingerprints ?? 0 },
+                        { label: 'Experience Replay (TD-priority)', value: persistenceStats.sqlite.experienceReplay ?? 0 },
+                        { label: 'Simulation Logs', value: persistenceStats.sqlite.simulationLogs ?? 0 },
+                        { label: 'Lineage Tree Nodes', value: persistenceStats.sqlite.lineage ?? 0 },
+                        { label: 'Generation Stats', value: persistenceStats.sqlite.generationStats ?? 0 },
+                        { label: 'Error Logs', value: persistenceStats.sqlite.errorLogs ?? 0 },
+                        { label: 'Feedback Entries', value: persistenceStats.sqlite.feedbackEntries ?? 0 },
+                        { label: 'Research Sessions', value: persistenceStats.sqlite.researchSessions ?? 0 },
                       ].map(row => (
                         <div key={row.label} className="flex justify-between items-center">
                           <span className="text-xs text-gray-400">{row.label}</span>
