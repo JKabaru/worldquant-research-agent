@@ -23,6 +23,8 @@ import { getDatabase, type DatabaseStats } from './persistence/database';
 import { getDataWarehouse } from './persistence/data-warehouse';
 import { eventBridge } from './event-bridge';
 import { formatSourceContextForPrompt, getConfiguredSourcePaths } from './source-memory';
+import { validateAlphaStatistical, extractLookbackWindows } from './validation-statistical';
+import { validateAlphaRegimeAware, buildRegimeContext } from './validation-regime';
 
 export type ResearchEventCallback = (event: {
   type: 'status' | 'alpha_generated' | 'simulation_submitted' | 'simulation_complete' |
@@ -1100,6 +1102,39 @@ export class ResearchEngine {
     if (alpha.sharpe >= thresholds.minSharpe && alpha.fitness >= thresholds.minFitness &&
         alpha.turnover <= thresholds.maxTurnover &&
         !alpha.checks.some(c => c.result === 'FAIL')) {
+      // Gap 6: Apply statistical validation before accepting
+      const statValidation = validateAlphaStatistical(
+        alpha,
+        null, // Would need actual daily returns data
+        null, // Would need partition sharpes
+        candidate.expression
+      );
+      
+      // Apply regime-aware validation
+      const regimeValidation = validateAlphaRegimeAware(
+        alpha,
+        this.state.macroRegime,
+        thresholds
+      );
+      
+      // Reject if statistical/regime validation fails
+      if (!statValidation.accepted || !regimeValidation.accepted) {
+        const allReasons = [...statValidation.reasons, ...regimeValidation.reasons];
+        this.addFeedback('middle', candidate.id, `Rejected by statistical/regime validation: ${allReasons.join(', ')}`, 'validation', 'rejected');
+        this.logTrace('validation_rejected', 'Alpha rejected by statistical/regime validation', candidate.id, {
+          statReasons: statValidation.reasons,
+          regimeReasons: regimeValidation.reasons,
+        });
+        
+        // Blacklist the pattern for future prevention
+        this.diversityManager.blacklistExpressionPattern(candidate.expression);
+        
+        candidate.status = 'failed';
+        candidate.error = `Statistical/regime validation failed: ${allReasons.join('; ')}`;
+        this.state.candidateQueue.push(candidate);
+        return result;
+      }
+      
       // Alpha passes all thresholds - accept it
       this.acceptAlpha(candidate, alpha);
       return result;
@@ -1506,19 +1541,26 @@ Each hypothesis should be 1-2 sentences of plain English.`;
        prompt += '\n\n';
      }
 
-     // Correlation feedback — show rejected operator/field patterns to avoid
-     const correlationContext = this.diversityManager.getCorrelationSummary();
-     if (correlationContext) {
-       prompt += correlationContext;
-       prompt += '\n';
-       prompt += 'Note: These patterns were correlated with existing portfolio. Explore different data domains or operator combinations.\n\n';
-     }
+// Correlation feedback — show rejected operator/field patterns to avoid
+      const correlationContext = this.diversityManager.getCorrelationSummary();
+      if (correlationContext) {
+        prompt += correlationContext;
+        prompt += '\n';
+        prompt += 'Note: These patterns were correlated with existing portfolio. Explore different data domains or operator combinations.\n\n';
+      }
 
-     prompt += `Strategy: ${outerResult.strategy} | Mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%\n`;
-     prompt += this.buildSourceGuidanceBlock(
-      `hypothesis generation ${style} ${outerResult.strategy} ${styleConfig.datasets.join(' ')}`
-     );
-     prompt += `Generate ${count} diverse, testable investment hypotheses.`;
+      // Gap 8: Regime-aware context
+      prompt += buildRegimeContext(this.state.macroRegime, this.state.livingAlphas.slice(0, 10).map(a => ({
+        alphaId: a.id,
+        suitability: a.sharpe > 0 ? Math.min(1, a.sharpe / 3) : 0,
+      })));
+      prompt += '\n';
+
+      prompt += `Strategy: ${outerResult.strategy} | Mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%\n`;
+      prompt += this.buildSourceGuidanceBlock(
+       `hypothesis generation ${style} ${outerResult.strategy} ${styleConfig.datasets.join(' ')}`
+      );
+      prompt += `Generate ${count} diverse, testable investment hypotheses.`;
     return prompt;
   }
 
@@ -1595,14 +1637,19 @@ Each hypothesis should be 1-2 sentences of plain English.`;
     });
     prompt += '\n';
 
-    // Context from experience buffer
+    // Context from experience buffer (enhanced with novelty/learning value)
     if (this.state.experienceBuffer.length > 0) {
       const topExperiences = this.state.experienceBuffer
-        .sort((a, b) => b.improvement - a.improvement)
+        .sort((a, b) => {
+          // Prioritize by combined score: improvement * novelty * learning value
+          const scoreA = a.improvement * (a.noveltyScore ?? 0.5) * (a.learningValue ?? 0.5);
+          const scoreB = b.improvement * (b.noveltyScore ?? 0.5) * (b.learningValue ?? 0.5);
+          return scoreB - scoreA;
+        })
         .slice(0, 5);
       prompt += `## What works (from experience buffer):\n`;
       prompt += topExperiences.map(e =>
-        `- Pattern ${this.diversityManager.extractPatternSignature(e.expression)} with strategy "${e.strategy}" improved metric by ${e.improvement.toFixed(3)}`
+        `- Pattern ${this.diversityManager.extractPatternSignature(e.expression)} with strategy "${e.strategy}" improved by ${e.improvement.toFixed(3)}${e.noveltyScore ? ` (novelty: ${(e.noveltyScore * 100).toFixed(0)}%)` : ''}${e.learningValue ? ` (learning: ${(e.learningValue * 100).toFixed(0)}%)` : ''}`
       ).join('\n');
       prompt += '\n\n';
     }
@@ -1617,15 +1664,22 @@ Each hypothesis should be 1-2 sentences of plain English.`;
        prompt += '\n\n';
      }
 
-     // Correlation feedback — rolling summary
-     const correlationContext = this.diversityManager.getCorrelationSummary();
-     if (correlationContext) {
-       prompt += correlationContext;
-       prompt += '\n';
-       prompt += 'Note: These operator+field patterns were rejected due to portfolio correlation. Diversify by using different operators, fields, or neutralization methods.\n\n';
-     }
+// Correlation feedback — rolling summary
+      const correlationContext = this.diversityManager.getCorrelationSummary();
+      if (correlationContext) {
+        prompt += correlationContext;
+        prompt += '\n';
+        prompt += 'Note: These operator+field patterns were rejected due to portfolio correlation. Diversify by using different operators, fields, or neutralization methods.\n\n';
+      }
 
-     prompt += `Translate each hypothesis into a complete FASTEXPR expression. Use ${styleConfig.datasets.join(', ')} data.\n`;
+      // Gap 8: Regime-aware context for hypothesis translation
+      prompt += buildRegimeContext(this.state.macroRegime, this.state.livingAlphas.slice(0, 10).map(a => ({
+        alphaId: a.id,
+        suitability: a.sharpe > 0 ? Math.min(1, a.sharpe / 3) : 0,
+      })));
+      prompt += '\n';
+
+      prompt += `Translate each hypothesis into a complete FASTEXPR expression. Use ${styleConfig.datasets.join(', ')} data.\n`;
      prompt += `Strategy: ${outerResult.strategy} | Mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%\n`;
      prompt += this.buildSourceGuidanceBlock(
       `code translation ${style} ${outerResult.strategy} ${styleConfig.operators.join(' ')} ${hypotheses.join(' ')}`
@@ -1741,25 +1795,36 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
       prompt += '\n\n';
     }
 
-     // Include experience buffer insights
-     if (this.state.experienceBuffer.length > 0) {
-       const topExperiences = this.state.experienceBuffer
-         .sort((a, b) => b.improvement - a.improvement)
-         .slice(0, 5);
-       prompt += `## What works (from experience buffer):\n`;
-       prompt += topExperiences.map(e =>
-         `- Pattern ${this.diversityManager.extractPatternSignature(e.expression)} improved metric by ${e.improvement.toFixed(3)}`
-       ).join('\n');
-       prompt += '\n\n';
-     }
+// Include experience buffer insights (enhanced with novelty/learning value)
+      if (this.state.experienceBuffer.length > 0) {
+        const topExperiences = this.state.experienceBuffer
+          .sort((a, b) => {
+            const scoreA = a.improvement * (a.noveltyScore ?? 0.5) * (a.learningValue ?? 0.5);
+            const scoreB = b.improvement * (b.noveltyScore ?? 0.5) * (b.learningValue ?? 0.5);
+            return scoreB - scoreA;
+          })
+          .slice(0, 5);
+        prompt += `## What works (from experience buffer):\n`;
+        prompt += topExperiences.map(e =>
+          `- Pattern ${this.diversityManager.extractPatternSignature(e.expression)} improved by ${e.improvement.toFixed(3)}${e.noveltyScore ? ` (novelty: ${(e.noveltyScore * 100).toFixed(0)}%)` : ''}`
+        ).join('\n');
+        prompt += '\n\n';
+      }
 
-     // Include correlation feedback (rolling summary of recent rejections)
-     const correlationContext = this.diversityManager.getCorrelationSummary();
-     if (correlationContext) {
-       prompt += correlationContext;
-       prompt += '\n';
-       prompt += 'Note: These patterns correlated with existing portfolio. Find alternative operators, data fields, or neutralization approaches.\n\n';
-     }
+      // Include correlation feedback (rolling summary of recent rejections)
+      const correlationContext = this.diversityManager.getCorrelationSummary();
+      if (correlationContext) {
+        prompt += correlationContext;
+        prompt += '\n';
+        prompt += 'Note: These patterns correlated with existing portfolio. Find alternative operators, data fields, or neutralization approaches.\n\n';
+      }
+
+      // Gap 8: Regime-aware context
+      prompt += buildRegimeContext(this.state.macroRegime, this.state.livingAlphas.slice(0, 10).map(a => ({
+        alphaId: a.id,
+        suitability: a.sharpe > 0 ? Math.min(1, a.sharpe / 3) : 0,
+      })));
+      prompt += '\n';
 
      prompt += `## Strategy: ${outerResult.strategy} (mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%)\n\n`;
      prompt += this.buildSourceGuidanceBlock(
@@ -2246,13 +2311,34 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
     return sharpe - lambdaR * residualRisk * residualRisk;
   }
 
-  // --- Experience Buffer & Lineage ---
+// --- Experience Buffer & Lineage ---
 
+  /**
+   * Enhanced experience buffer with novelty and learning value scoring.
+   * Implements experience prioritization to focus on high-information experiences.
+   */
   private addToExperienceBuffer(candidate: AlphaCandidate, alpha: WQAlpha): void {
+    const context = {
+      currentStyle: this.state.config?.datasetRotation?.[0] || undefined,
+      recentTopics: this.state.generationStats
+        .slice(-3)
+        .map(g => g.dominantCategory)
+        .filter((cat, index, self) => self.indexOf(cat) === index)
+    };
+    
     // Use previous experience if there was a modification
     const recentCorrection = this.state.feedbackHistory.find(
       f => f.candidateId === candidate.id && f.loop === 'inner' && f.action === 'correction'
     );
+
+    // Compute novelty score by comparing expression to existing hypotheses in source memory
+    const noveltyScore = this.computeExperienceNovelty(candidate.expression);
+    
+    // Compute learning value based on improvement magnitude and strategy
+    const learningValue = this.computeExperienceLearningValue(alpha, candidate, recentCorrection);
+    
+    // Extract relevance tags for this experience
+    const relevanceTags = this.extractExperienceRelevanceTags(candidate.expression, alpha);
 
     const improvement = alpha.sharpe;
     const tuple: ExperienceTuple = {
@@ -2263,6 +2349,12 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
       strategy: candidate.strategy,
       timestamp: new Date().toISOString(),
       improvement,
+      // Knowledge enhancement fields
+      noveltyScore,
+      learningValue,
+      usageCount: 0,
+      lastUsedTimestamp: Date.now(),
+      relevanceTags,
     };
 
     this.state.experienceBuffer.push(tuple);
@@ -2281,10 +2373,132 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
       } catch { /* non-fatal */ }
     }
 
-    // Keep in-memory buffer manageable
-    if (this.state.experienceBuffer.length > 1000) {
-      this.state.experienceBuffer = this.state.experienceBuffer.slice(-500);
+    // Apply forgetting mechanism: prune low-value experiences when buffer exceeds threshold
+    this.pruneExperienceBuffer();
+  }
+
+  /**
+   * Compute novelty score for an experience based on structural difference from existing patterns.
+   * Higher score means more novel (different from existing hypotheses).
+   */
+  private computeExperienceNovelty(expression: string): number {
+    // Extract pattern signature for comparison
+    const signature = this.diversityManager.extractPatternSignature(expression);
+    
+    // Compare to existing fingerprints in diversity manager
+    let maxSimilarity = 0;
+    for (const fp of this.diversityManager['fingerprints'].values()) {
+      const similarity = this.diversityManager.computeStructuralSimilarity(
+        this.diversityManager.extractStructuralFingerprint(expression),
+        fp.structuralFingerprint || { operators: [], fields: [], pattern: '', arity: '', operatorSequence: [] }
+      );
+      maxSimilarity = Math.max(maxSimilarity, similarity);
     }
+    
+    // Novelty is inverse of maximum similarity to existing patterns
+    const noveltyScore = 1 - maxSimilarity;
+    return Math.max(0, Math.min(1, noveltyScore));
+  }
+
+  /**
+   * Compute learning value based on improvement magnitude and strategy effectiveness.
+   * Higher value indicates more educational potential.
+   */
+  private computeExperienceLearningValue(
+    alpha: WQAlpha,
+    candidate: AlphaCandidate,
+    recentCorrection: { result: string } | undefined
+  ): number {
+    // Base value from Sharpe improvement
+    const improvementValue = Math.max(0, alpha.sharpe) / 3.0; // Normalize to 0-1
+    
+    // Strategy diversity bonus: rare strategies are more valuable
+    const strategyCount = this.state.experienceBuffer.filter(
+      e => e.strategy === candidate.strategy
+    ).length;
+    const strategyBonus = Math.max(0, 0.2 - strategyCount * 0.02); // Decrease with frequency
+    
+    // Fitness quality bonus
+    const fitnessBonus = Math.max(0, (alpha.fitness - 0.8) / 2.0); // Bonus for fitness > 0.8
+    
+    // Penalty for high turnover (less learnable due to noise)
+    const turnoverPenalty = Math.max(0, (alpha.turnover - 0.7) / 0.3);
+    
+    const learningValue = improvementValue + strategyBonus + fitnessBonus - turnoverPenalty;
+    return Math.max(0, Math.min(1, learningValue));
+  }
+
+  /**
+   * Extract relevance tags from expression and alpha metrics.
+   */
+  private extractExperienceRelevanceTags(expression: string, alpha: WQAlpha): string[] {
+    const tags: string[] = [];
+    const lower = expression.toLowerCase();
+    
+    // Style tags
+    if (/value|book|pe_ratio|pb_ratio|cashflow|revenue|earnings/i.test(lower)) {
+      tags.push('value');
+    }
+    if (/momentum|ts_delta|ts_returns|trend/i.test(lower)) {
+      tags.push('momentum');
+    }
+    if (/quality|accrual|roic|margin/i.test(lower)) {
+      tags.push('quality');
+    }
+    if (/volatility|std_dev|skew|kurtosis/i.test(lower)) {
+      tags.push('volatility');
+    }
+    if (/sentiment|news|analyst/i.test(lower)) {
+      tags.push('sentiment');
+    }
+    
+    // Performance tags
+    if (alpha.sharpe > 1.5) {
+      tags.push('high_sharpe');
+    }
+    if (alpha.turnover < 0.4) {
+      tags.push('low_turnover');
+    }
+    
+    // Category tags from diversity manager
+    const category = this.diversityManager['classifyCategory'](expression);
+    if (category && category !== 'Other') {
+      tags.push(category.toLowerCase().replace('-', '_'));
+    }
+    
+    return tags;
+  }
+
+  /**
+   * Prune experience buffer to keep it manageable and focused on high-value experiences.
+   * Implements forgetting mechanism for low-value or obsolete experiences.
+   */
+  private pruneExperienceBuffer(): void {
+    const MAX_BUFFER_SIZE = 1000;
+    const PRUNE_THRESHOLD = 500;
+    
+    if (this.state.experienceBuffer.length <= PRUNE_THRESHOLD) return;
+    
+    // Apply temporal decay to older experiences
+    const now = Date.now();
+    const decayHalfLife = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
+    
+    // Sort by combined score (novelty * learning value * temporal decay)
+    const scored = this.state.experienceBuffer.map(exp => {
+      const novelty = exp.noveltyScore ?? 0.5;
+      const learning = exp.learningValue ?? 0.5;
+      const age = now - (exp.lastUsedTimestamp ?? now);
+      const temporalDecay = Math.max(0.1, 1 - age / decayHalfLife);
+      
+      return { ...exp, score: novelty * learning * temporalDecay };
+    });
+    
+    // Sort descending by score
+    scored.sort((a, b) => b.score - a.score);
+    
+    // Keep top experiences plus some diversity
+    const keepCount = Math.min(MAX_BUFFER_SIZE, this.state.experienceBuffer.length);
+    this.state.experienceBuffer = scored.slice(0, keepCount).map(({ score, ...exp }) => exp);
   }
 
   private trackLineage(candidate: AlphaCandidate, alpha: WQAlpha): void {

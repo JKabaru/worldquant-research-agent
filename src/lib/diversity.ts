@@ -817,67 +817,89 @@ export class DiversityManager {
     return count < this.maxPerCategory;
   }
 
-  canAcceptStyle(style: StylePremia): boolean {
+canAcceptStyle(style: StylePremia): boolean {
     const count = this.styleCounts.get(style) || 0;
     return count < this.maxPerStyle;
   }
 
-   // --- Overall Diversity Check ---
-   evaluateCandidate(candidate: AlphaCandidate): {
-     accepted: boolean;
-     reasons: string[];
-     diversityScore: number;
-   } {
-     const reasons: string[] = [];
-     let score = 1.0;
-
-     // Hard blacklist check for previously rejected near-duplicate signatures.
-     const patternSignature = this.extractPatternSignature(candidate.expression);
-     if (this.blacklistedPatternSignatures.has(patternSignature)) {
-       reasons.push('Pattern signature is blacklisted due to prior high-correlation rejection');
-       score -= 0.8;
-     }
-
-// Check fingerprint duplicate
-      if (this.isDuplicate(candidate.fingerprint)) {
-        reasons.push('Duplicate fingerprint detected');
-        score -= 0.5;
+  /**
+   * Check if an expression is structurally similar to any existing fingerprint.
+   * Used for conceptual redundancy detection in evaluateCandidate.
+   */
+  protected isConceptuallySimilar(expression: string): boolean {
+    const candidateFingerprint = this.extractStructuralFingerprint(expression);
+    
+    for (const fp of this.fingerprints.values()) {
+      if (fp.structuralFingerprint) {
+        const similarity = this.computeStructuralSimilarity(
+          candidateFingerprint,
+          fp.structuralFingerprint
+        );
+        if (similarity >= 0.75) {
+          return true;
+        }
       }
-
-      // Check semantic redundancy
-      if (this.isSemanticallyRedundant(candidate.expression)) {
-        reasons.push('Semantically redundant with existing alpha');
-        score -= 0.3;
-      }
-
-      // Check structural similarity (conceptual redundancy)
-      if (this.isStructurallySimilar(candidate.expression)) {
-        reasons.push('Structurally similar to existing alpha (conceptual redundancy)');
-        score -= 0.25;
-      }
-
-      // Categorize candidate
-      const category = this.classifyCategory(candidate.expression);
-      const style = this.classifyStyle(candidate.expression);
-
-      // Check category budget
-      if (!this.canAcceptCategory(category)) {
-        reasons.push(`Category '${category}' budget exceeded (${this.maxPerCategory} max)`);
-        score -= 0.2;
-      }
-
-      // Check style budget
-      if (!this.canAcceptStyle(style)) {
-        reasons.push(`Style '${style}' budget exceeded (${this.maxPerStyle} max)`);
-        score -= 0.2;
-      }
-
-      return {
-        accepted: reasons.length === 0,
-        reasons,
-        diversityScore: Math.max(0, score),
-      };
     }
+    
+    return false;
+  }
+
+  // --- Overall Diversity Check ---
+  evaluateCandidate(candidate: AlphaCandidate): {
+    accepted: boolean;
+    reasons: string[];
+    diversityScore: number;
+  } {
+    const reasons: string[] = [];
+    let score = 1.0;
+
+    // Hard blacklist check for previously rejected near-duplicate signatures.
+    const patternSignature = this.extractPatternSignature(candidate.expression);
+    if (this.blacklistedPatternSignatures.has(patternSignature)) {
+      reasons.push('Pattern signature is blacklisted due to prior high-correlation rejection');
+      score -= 0.8;
+    }
+
+    // Check fingerprint duplicate
+    if (this.isDuplicate(candidate.fingerprint)) {
+      reasons.push('Duplicate fingerprint detected');
+      score -= 0.5;
+    }
+
+    // Check semantic redundancy
+    if (this.isSemanticallyRedundant(candidate.expression)) {
+      reasons.push('Semantically redundant with existing alpha');
+      score -= 0.3;
+    }
+
+    // Check structural similarity (conceptual redundancy)
+    if (this.isConceptuallySimilar(candidate.expression)) {
+      reasons.push('Structurally similar to existing alpha (conceptual redundancy)');
+      score -= 0.25;
+    }
+
+    // Categorize candidate
+    const category = this.classifyCategory(candidate.expression);
+    const style = this.classifyStyle(candidate.expression);
+
+    // Check category budget
+    if (!this.canAcceptCategory(category)) {
+      reasons.push(`Category '${category}' budget exceeded (${this.maxPerCategory} max)`);
+      score -= 0.2;
+    }
+
+    // Check style budget
+    if (!this.canAcceptStyle(style)) {
+      reasons.push(`Style '${style}' budget exceeded (${this.maxPerStyle} max)`);
+      score -= 0.2;
+    }
+
+    return {
+      accepted: reasons.length === 0,
+      reasons,
+      diversityScore: Math.max(0, score),
+    };
+  }
 
   private classifyCategory(expression: string): string {
     const lower = expression.toLowerCase();
