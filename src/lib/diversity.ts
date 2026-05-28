@@ -140,20 +140,30 @@ export class DiversityManager {
     return union.size > 0 ? intersection.size / union.size : 0;
   }
 
-  isSemanticallyRedundant(expression: string, threshold: number = 0.85): boolean {
-    const newTokens = new Set(this.tokenize(expression));
+   isSemanticallyRedundant(expression: string, threshold: number = 0.85): boolean {
+     const newTokens = new Set(this.tokenize(expression));
+     const newSignature = this.extractPatternSignature(expression);
 
-    for (const fp of this.fingerprints.values()) {
-      const existingTokens = new Set(this.tokenize(fp.expression));
-      const intersection = new Set([...newTokens].filter(t => existingTokens.has(t)));
-      const union = new Set([...newTokens, ...existingTokens]);
-      const similarity = union.size > 0 ? intersection.size / union.size : 0;
-
-      if (similarity >= threshold) return true;
-    }
-
-    return false;
-  }
+     for (const fp of this.fingerprints.values()) {
+       const existingTokens = new Set(this.tokenize(fp.expression));
+       const existingSignature = this.extractPatternSignature(fp.expression);
+       
+       // Check token-based similarity
+       const tokenIntersection = new Set([...newTokens].filter(t => existingTokens.has(t)));
+       const tokenUnion = new Set([...newTokens, ...existingTokens]);
+       const tokenSimilarity = tokenUnion.size > 0 ? tokenIntersection.size / tokenUnion.size : 0;
+       
+       // Check signature-based similarity (exact match on pattern signature)
+       const signatureMatch = newSignature === existingSignature ? 1.0 : 0.0;
+       
+       // Combined similarity score (weighted average)
+       const combinedSimilarity = tokenSimilarity * 0.7 + signatureMatch * 0.3;
+       
+       if (combinedSimilarity >= threshold) return true;
+     }
+ 
+     return false;
+   }
 
   private tokenize(expr: string): string[] {
     // Extract operators, data fields and window constants as tokens.
@@ -282,22 +292,157 @@ export class DiversityManager {
     };
   }
 
-  private detectArityDynamic(operatorSequence: string[]): string {
-    const hasBinaryOp = (expr: string): boolean => {
-      return /[*+/-]/.test(expr);
-    };
-    
-    const hasMultipleRanks = operatorSequence.filter(op => 
-      op === 'rank' || op === 'ts_rank'
-    ).length >= 2;
+   private detectArityDynamic(operatorSequence: string[]): string {
+     const hasBinaryOp = (expr: string): boolean => {
+       return /[*+/-]/.test(expr);
+     };
+     
+     const hasMultipleRanks = operatorSequence.filter(op => 
+       op === 'rank' || op === 'ts_rank'
+     ).length >= 2;
 
-    if (hasMultipleRanks || operatorSequence.length >= 2) {
-      return 'binary_combine';
-    }
-    return 'unary_chain';
-  }
+     if (hasMultipleRanks || operatorSequence.length >= 2) {
+       return 'binary_combine';
+     }
+     return 'unary_chain';
+   }
 
-  private generatePatternSignatureDynamic(expression: string, operators: string[]): string {
+   /**
+    * Check if two expressions are structurally similar based on their operator sequences
+    * and field usage patterns, even if the specific operators/fields differ.
+    */
+   isStructurallySimilar(expression1: string, expression2: string, threshold: number = 0.75): boolean {
+     const fp1 = this.extractStructuralFingerprint(expression1);
+     const fp2 = this.extractStructuralFingerprint(expression2);
+     
+     // Compare operator sequences (normalized)
+     const opSeqSimilarity = this.compareOperatorSequences(fp1.operatorSequence, fp2.operatorSequence);
+     
+     // Compare field usage patterns
+     const fieldPatternSimilarity = this.compareFieldPatterns(fp1.fieldTransforms, fp2.fieldTransforms);
+     
+     // Compare overall structure (arity and complexity)
+     const structureSimilarity = this.compareStructuralProperties(fp1, fp2);
+     
+     // Weighted combination
+     const combinedSimilarity = 
+       opSeqSimilarity * 0.4 + 
+       fieldPatternSimilarity * 0.3 + 
+       structureSimilarity * 0.3;
+       
+     return combinedSimilarity >= threshold;
+   }
+
+   /**
+    * Compare two operator sequences for similarity, accounting for equivalent operators
+    */
+   private compareOperatorSequences(seq1: string[], seq2: string[]): number {
+     if (seq1.length === 0 && seq2.length === 0) return 1.0;
+     if (seq1.length === 0 || seq2.length === 0) return 0.0;
+     
+     // Normalize operator sequences by mapping to categories
+     const normalizedSeq1 = seq1.map(op => OPERATOR_CATEGORIES[op] || 'custom');
+     const normalizedSeq2 = seq2.map(op => OPERATOR_CATEGORIES[op] || 'custom');
+     
+     // Use longest common subsequence ratio
+     const lcsLength = this.longestCommonSubsequenceLength(normalizedSeq1, normalizedSeq2);
+     const maxLength = Math.max(normalizedSeq1.length, normalizedSeq2.length);
+     
+     return maxLength > 0 ? lcsLength / maxLength : 0;
+   }
+
+   /**
+    * Compare field usage patterns between two expressions
+    */
+   private compareFieldPatterns(transforms1: Record<string, string[]>, transforms2: Record<string, string[]>): number {
+     const ops1 = new Set(Object.keys(transforms1));
+     const ops2 = new Set(Object.keys(transforms2));
+     
+     const commonOps = new Set([...ops1].filter(op => ops2.has(op)));
+     const allOps = new Set([...ops1, ...ops2]);
+     
+     if (allOps.size === 0) return 1.0;
+     const overlapRatio = commonOps.size / allOps.size;
+     
+     // For common operators, compare field usage
+     let fieldSimilarity = 0;
+     let comparisonCount = 0;
+     
+     for (const op of commonOps) {
+       const fields1 = new Set(transforms1[op] || []);
+       const fields2 = new Set(transforms2[op] || []);
+       
+       if (fields1.size === 0 && fields2.size === 0) {
+         fieldSimilarity += 1;
+       } else if (fields1.size > 0 || fields2.size > 0) {
+         const intersection = new Set([...fields1].filter(f => fields2.has(f)));
+         const union = new Set([...fields1, ...fields2]);
+         const similarity = union.size > 0 ? intersection.size / union.size : 0;
+         fieldSimilarity += similarity;
+       }
+       comparisonCount++;
+     }
+     
+     const avgFieldSimilarity = comparisonCount > 0 ? fieldSimilarity / comparisonCount : 0;
+     return (overlapRatio * 0.5) + (avgFieldSimilarity * 0.5);
+   }
+
+   /**
+    * Compare structural properties like arity, complexity, etc.
+    */
+   private compareStructuralProperties(fp1: StructuralFingerprint, fp2: StructuralFingerprint): number {
+     let similarity = 0;
+     let comparisons = 0;
+     
+     // Compare arity
+     if (fp1.arity === fp2.arity) {
+       similarity += 1;
+     }
+     comparisons++;
+     
+     // Compare operator count similarity (normalized)
+     const opCount1 = fp1.operators.length;
+     const opCount2 = fp2.operators.length;
+     const maxOpCount = Math.max(opCount1, opCount2);
+     if (maxOpCount > 0) {
+       similarity += 1 - Math.abs(opCount1 - opCount2) / maxOpCount;
+     }
+     comparisons++;
+     
+     // Compare field count similarity
+     const fieldCount1 = fp1.fields.length;
+     const fieldCount2 = fp2.fields.length;
+     const maxFieldCount = Math.max(fieldCount1, fieldCount2);
+     if (maxFieldCount > 0) {
+       similarity += 1 - Math.abs(fieldCount1 - fieldCount2) / maxFieldCount;
+     }
+     comparisons++;
+     
+     return comparisons > 0 ? similarity / comparisons : 0;
+   }
+
+   /**
+    * Helper function to compute longest common subsequence length
+    */
+   private longestCommonSubsequenceLength<T>(seq1: T[], seq2: T[]): number {
+     const m = seq1.length;
+     const n = seq2.length;
+     const dp: number[][] = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+     
+     for (let i = 1; i <= m; i++) {
+       for (let j = 1; j <= n; j++) {
+         if (seq1[i - 1] === seq2[j - 1]) {
+           dp[i][j] = dp[i - 1][j - 1] + 1;
+         } else {
+           dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+         }
+       }
+     }
+     
+     return dp[m][n];
+   }
+
+   private generatePatternSignatureDynamic(expression: string, operators: string[]): string {
     let sig = expression;
     
     const uniqueOps = [...new Set(operators)];
@@ -462,16 +607,16 @@ export class DiversityManager {
     return { pearson, spearman, maxRolling, avgRolling, stability };
   }
 
-  computeAdaptiveThreshold(): number {
-    const totalFingerprints = this.fingerprints.size;
-    const portfolioDiversity = this.computeAggregateCoverage();
+   computeAdaptiveThreshold(): number {
+     const totalFingerprints = this.fingerprints.size;
+     const portfolioDiversity = this.computeAggregateCoverage();
 
-    const baseThreshold = this.maxCorrelation;
-    const diversityBonus = Math.min(0.15, (totalFingerprints / 100) * 0.05);
-    const penalty = portfolioDiversity > 0.5 ? 0.05 : 0;
+     const baseThreshold = this.maxCorrelation;
+     const diversityPenalty = Math.min(0.15, (totalFingerprints / 100) * 0.05);
+     const penalty = portfolioDiversity > 0.5 ? 0.05 : 0;
 
-    return Math.max(0.25, Math.min(0.5, baseThreshold - penalty + diversityBonus));
-  }
+     return Math.max(0.25, Math.min(0.5, baseThreshold - penalty - diversityPenalty));
+   }
 
   /**
    * PCA-based Pre-Simulation Correlation Prediction.
@@ -677,57 +822,62 @@ export class DiversityManager {
     return count < this.maxPerStyle;
   }
 
-  // --- Overall Diversity Check ---
+   // --- Overall Diversity Check ---
+   evaluateCandidate(candidate: AlphaCandidate): {
+     accepted: boolean;
+     reasons: string[];
+     diversityScore: number;
+   } {
+     const reasons: string[] = [];
+     let score = 1.0;
 
-  evaluateCandidate(candidate: AlphaCandidate): {
-    accepted: boolean;
-    reasons: string[];
-    diversityScore: number;
-  } {
-    const reasons: string[] = [];
-    let score = 1.0;
+     // Hard blacklist check for previously rejected near-duplicate signatures.
+     const patternSignature = this.extractPatternSignature(candidate.expression);
+     if (this.blacklistedPatternSignatures.has(patternSignature)) {
+       reasons.push('Pattern signature is blacklisted due to prior high-correlation rejection');
+       score -= 0.8;
+     }
 
-    // Hard blacklist check for previously rejected near-duplicate signatures.
-    const patternSignature = this.extractPatternSignature(candidate.expression);
-    if (this.blacklistedPatternSignatures.has(patternSignature)) {
-      reasons.push('Pattern signature is blacklisted due to prior high-correlation rejection');
-      score -= 0.8;
+// Check fingerprint duplicate
+      if (this.isDuplicate(candidate.fingerprint)) {
+        reasons.push('Duplicate fingerprint detected');
+        score -= 0.5;
+      }
+
+      // Check semantic redundancy
+      if (this.isSemanticallyRedundant(candidate.expression)) {
+        reasons.push('Semantically redundant with existing alpha');
+        score -= 0.3;
+      }
+
+      // Check structural similarity (conceptual redundancy)
+      if (this.isStructurallySimilar(candidate.expression)) {
+        reasons.push('Structurally similar to existing alpha (conceptual redundancy)');
+        score -= 0.25;
+      }
+
+      // Categorize candidate
+      const category = this.classifyCategory(candidate.expression);
+      const style = this.classifyStyle(candidate.expression);
+
+      // Check category budget
+      if (!this.canAcceptCategory(category)) {
+        reasons.push(`Category '${category}' budget exceeded (${this.maxPerCategory} max)`);
+        score -= 0.2;
+      }
+
+      // Check style budget
+      if (!this.canAcceptStyle(style)) {
+        reasons.push(`Style '${style}' budget exceeded (${this.maxPerStyle} max)`);
+        score -= 0.2;
+      }
+
+      return {
+        accepted: reasons.length === 0,
+        reasons,
+        diversityScore: Math.max(0, score),
+      };
     }
-
-    // Check fingerprint duplicate
-    if (this.isDuplicate(candidate.fingerprint)) {
-      reasons.push('Duplicate fingerprint detected');
-      score -= 0.5;
-    }
-
-    // Check semantic redundancy
-    if (this.isSemanticallyRedundant(candidate.expression)) {
-      reasons.push('Semantically redundant with existing alpha');
-      score -= 0.3;
-    }
-
-    // Categorize candidate
-    const category = this.classifyCategory(candidate.expression);
-    const style = this.classifyStyle(candidate.expression);
-
-    // Check category budget
-    if (!this.canAcceptCategory(category)) {
-      reasons.push(`Category '${category}' budget exceeded (${this.maxPerCategory} max)`);
-      score -= 0.2;
-    }
-
-    // Check style budget
-    if (!this.canAcceptStyle(style)) {
-      reasons.push(`Style '${style}' budget exceeded (${this.maxPerStyle} max)`);
-      score -= 0.2;
-    }
-
-    return {
-      accepted: reasons.length === 0,
-      reasons,
-      diversityScore: Math.max(0, score),
-    };
-  }
 
   private classifyCategory(expression: string): string {
     const lower = expression.toLowerCase();

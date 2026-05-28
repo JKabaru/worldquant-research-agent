@@ -1770,12 +1770,21 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
     return prompt;
   }
 
-  private buildSourceGuidanceBlock(query: string): string {
-    const { promptBlock, selectedIds, estimatedTokens } = formatSourceContextForPrompt(query, 5, 300);
-    this.addRetrievalTrace('source_guidance', selectedIds, estimatedTokens);
-    const sources = getConfiguredSourcePaths();
-    return `\n\n${promptBlock}\nSource files: ${sources.join(' | ')}\n`;
-  }
+   private buildSourceGuidanceBlock(query: string): string {
+     // Prepare context for better source selection
+     const context = {
+       currentStyle: this.state.config?.datasetRotation?.[0] || undefined,
+       recentTopics: this.state.generationStats
+         .slice(-3)
+         .map(g => g.dominantCategory)
+         .filter((cat, index, self) => self.indexOf(cat) === index) // Remove duplicates
+     };
+     
+     const { promptBlock, selectedIds, estimatedTokens } = formatSourceContextForPrompt(query, 5, 300, context);
+     this.addRetrievalTrace('source_guidance', selectedIds, estimatedTokens);
+     const sources = getConfiguredSourcePaths();
+     return `\n\n${promptBlock}\nSource files: ${sources.join(' | ')}\n`;
+   }
 
   // --- Candidate Quality Ranker (Generate many -> rank -> simulate few) ---
 

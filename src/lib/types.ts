@@ -321,6 +321,12 @@ export interface ExperienceTuple {
   strategy: string;
   timestamp: string;
   improvement: number;
+  // Knowledge enhancement fields
+  noveltyScore?: number; // 0-1 scale, measures difference from existing hypotheses
+  learningValue?: number; // 0-1 scale, measures educational value
+  usageCount?: number; // How many times this experience has been used for learning
+  lastUsedTimestamp?: number; // Unix timestamp when last accessed
+  relevanceTags?: string[]; // Tags indicating what this experience is relevant to
 }
 
 export interface LineageNode {

@@ -5,6 +5,12 @@ export type SourceSnippet = {
   topic: string;
   text: string;
   tags: string[];
+  // Knowledge enhancement fields
+  importanceScore?: number; // 0-1 scale, higher = more important
+  relevanceCategories?: string[]; // Categories this snippet is relevant to
+  addedTimestamp?: number; // Unix timestamp when added
+  lastUsedTimestamp?: number; // Unix timestamp when last used in context
+  usageCount?: number; // How many times this snippet has been used
 };
 
 export type RetrievalResult = {
@@ -29,6 +35,11 @@ const DISTILLED_SNIPPETS: SourceSnippet[] = [
     topic: 'Fast Expression language',
     text: 'BRAIN simulations use Fast Expression language with data fields and operators, not Python/R syntax for alpha submission.',
     tags: ['fastexpr', 'language', 'operators', 'data_fields'],
+    importanceScore: 0.9,
+    relevanceCategories: ['syntax', 'language'],
+    addedTimestamp: Date.now(),
+    lastUsedTimestamp: 0,
+    usageCount: 0,
   },
   {
     id: 'wq_2',
@@ -569,37 +580,70 @@ function tokenize(text: string): Set<string> {
   );
 }
 
-function scoreSnippet(snippet: SourceSnippet, queryTerms: Set<string>): number {
+function scoreSnippet(snippet: SourceSnippet, queryTerms: Set<string>, context?: { currentStyle?: string; recentTopics?: string[] }): number {
   if (queryTerms.size === 0) return 0;
+  
+  // Basic term matching score
   const snippetTerms = tokenize(`${snippet.topic} ${snippet.text} ${snippet.tags.join(' ')}`);
   let overlap = 0;
   for (const term of queryTerms) {
     if (snippetTerms.has(term)) overlap += 1;
   }
+  
+  // Normalize overlap score (0-1 range)
+  const normalizedOverlap = queryTerms.size > 0 ? overlap / queryTerms.size : 0;
+  
   // Reward explicit WQ operator mentions to prioritize implementation-relevant guidance.
   const operatorBoost = /(ts_|group_|rank|zscore|trade_when|neutralize|decay|turnover)/i.test(snippet.text) ? 0.5 : 0;
-  return overlap + operatorBoost;
+  
+  // Importance score boost (0-0.3 range)
+  const importanceBoost = (snippet.importanceScore ?? 0.5) * 0.3;
+  
+  // Recency boost - snippets used recently get a small boost
+  const recencyBoost = snippet.usageCount > 0 ? Math.min(0.2, Math.log(snippet.usageCount) * 0.05) : 0;
+  
+  // Category relevance boost
+  const categoryBoost = context?.recentTopics && snippet.relevanceCategories ? 
+    (snippet.relevanceCategories.some(cat => context.recentTopics.includes(cat)) ? 0.2 : 0) : 0;
+  
+  // Style relevance boost
+  const styleBoost = context?.currentStyle && snippet.relevanceCategories ?
+    (snippet.relevanceCategories.includes(context.currentStyle) ? 0.15 : 0) : 0;
+  
+  return normalizedOverlap + operatorBoost + importanceBoost + recencyBoost + categoryBoost + styleBoost;
 }
 
 export function retrieveSourceContext(
   query: string,
   maxSnippets: number = 6,
-  maxTokens: number = 380
+  maxTokens: number = 380,
+  context?: { currentStyle?: string; recentTopics?: string[] }
 ): RetrievalResult {
   const terms = tokenize(query);
   const ranked = DISTILLED_SNIPPETS
-    .map(snippet => ({ snippet, score: scoreSnippet(snippet, terms) }))
+    .map(snippet => ({ snippet, score: scoreSnippet(snippet, terms, context) }))
     .filter(item => item.score > 0)
     .sort((a, b) => b.score - a.score);
 
   const selected: SourceSnippet[] = [];
   let tokenCount = 0;
 
+  // Dynamic snippet count based on score distribution
+  const adaptiveMaxSnippets = Math.min(
+    maxSnippets,
+    Math.max(3, Math.floor(ranked.length * 0.3)) // At least 3, up to maxSnippets based on score distribution
+  );
+
   for (const item of ranked) {
-    if (selected.length >= maxSnippets) break;
+    if (selected.length >= adaptiveMaxSnippets) break;
     const snippetTokens = estimateTokens(item.snippet.text);
     if (tokenCount + snippetTokens > maxTokens) continue;
     selected.push(item.snippet);
+    
+    // Update usage statistics
+    item.snippet.usageCount = (item.snippet.usageCount || 0) + 1;
+    item.snippet.lastUsedTimestamp = Date.now();
+    
     tokenCount += snippetTokens;
   }
 
@@ -607,6 +651,8 @@ export function retrieveSourceContext(
   if (selected.length === 0 && DISTILLED_SNIPPETS.length > 0) {
     const fallback = DISTILLED_SNIPPETS[0];
     selected.push(fallback);
+    fallback.usageCount = (fallback.usageCount || 0) + 1;
+    fallback.lastUsedTimestamp = Date.now();
     tokenCount = estimateTokens(fallback.text);
   }
 
@@ -616,9 +662,10 @@ export function retrieveSourceContext(
 export function formatSourceContextForPrompt(
   query: string,
   maxSnippets: number = 6,
-  maxTokens: number = 380
+  maxTokens: number = 380,
+  context?: { currentStyle?: string; recentTopics?: string[] }
 ): { promptBlock: string; selectedIds: string[]; estimatedTokens: number } {
-  const retrieval = retrieveSourceContext(query, maxSnippets, maxTokens);
+  const retrieval = retrieveSourceContext(query, maxSnippets, maxTokens, context);
   const lines: string[] = [];
   lines.push('## Distilled source guidance (budget-limited):');
   for (const snippet of retrieval.selected) {
@@ -647,7 +694,8 @@ export function getConfiguredSourcePaths(): string[] {
 export function previewSourceContext(
   query: string,
   maxSnippets: number = 6,
-  maxTokens: number = 380
+  maxTokens: number = 380,
+  context?: { currentStyle?: string; recentTopics?: string[] }
 ): {
   query: string;
   maxSnippets: number;
@@ -662,7 +710,7 @@ export function previewSourceContext(
     tags: string[];
   }>;
 } {
-  const { selected, estimatedTokens } = retrieveSourceContext(query, maxSnippets, maxTokens);
+  const { selected, estimatedTokens } = retrieveSourceContext(query, maxSnippets, maxTokens, context);
   return {
     query,
     maxSnippets,
