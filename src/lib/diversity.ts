@@ -810,37 +810,36 @@ export class DiversityManager {
     return [];
   }
 
-  // --- Category and Style Budgets ---
+// --- Category and Style Budgets ---
 
   canAcceptCategory(category: string): boolean {
     const count = this.categoryCounts.get(category) || 0;
     return count < this.maxPerCategory;
   }
 
-canAcceptStyle(style: StylePremia): boolean {
+  canAcceptStyle(style: StylePremia): boolean {
     const count = this.styleCounts.get(style) || 0;
     return count < this.maxPerStyle;
   }
 
-  /**
+/**
    * Check if an expression is structurally similar to any existing fingerprint.
    * Used for conceptual redundancy detection in evaluateCandidate.
    */
   protected isConceptuallySimilar(expression: string): boolean {
     const candidateFingerprint = this.extractStructuralFingerprint(expression);
-    
+
     for (const fp of this.fingerprints.values()) {
-      if (fp.structuralFingerprint) {
-        const similarity = this.computeStructuralSimilarity(
-          candidateFingerprint,
-          fp.structuralFingerprint
-        );
-        if (similarity >= 0.75) {
-          return true;
-        }
+      if (!fp.structuralFingerprint) continue;
+      const similarity = this.computeStructuralSimilarity(
+        candidateFingerprint,
+        fp.structuralFingerprint
+      );
+      if (similarity >= 0.75) {
+        return true;
       }
     }
-    
+
     return false;
   }
 

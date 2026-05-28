@@ -1090,10 +1090,10 @@ export class ResearchEngine {
       );
       this.diversityManager.recordCorrelationRejection(candidate, {
         pcaCoverage: maxReportedCorrelation,
-        topMatches: topMatches.map(m => ({
-          clusterId: this.diversityManager.getOrCreateClusterId(m.alphaId),
-          similarity: m.similarity,
-        })),
+topMatches: topMatches.map(m => ({
+           clusterId: this.diversityManager.getOrCreateClusterId(m.alphaId),
+            similarity: m.similarity,
+         })),
       });
       return result;
     }
@@ -1795,61 +1795,61 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
       prompt += '\n\n';
     }
 
-// Include experience buffer insights (enhanced with novelty/learning value)
-      if (this.state.experienceBuffer.length > 0) {
-        const topExperiences = this.state.experienceBuffer
-          .sort((a, b) => {
-            const scoreA = a.improvement * (a.noveltyScore ?? 0.5) * (a.learningValue ?? 0.5);
-            const scoreB = b.improvement * (b.noveltyScore ?? 0.5) * (b.learningValue ?? 0.5);
-            return scoreB - scoreA;
-          })
-          .slice(0, 5);
-        prompt += `## What works (from experience buffer):\n`;
-        prompt += topExperiences.map(e =>
-          `- Pattern ${this.diversityManager.extractPatternSignature(e.expression)} improved by ${e.improvement.toFixed(3)}${e.noveltyScore ? ` (novelty: ${(e.noveltyScore * 100).toFixed(0)}%)` : ''}`
-        ).join('\n');
-        prompt += '\n\n';
-      }
+    // Include experience buffer insights (enhanced with novelty/learning value)
+    if (this.state.experienceBuffer.length > 0) {
+      const topExperiences = this.state.experienceBuffer
+        .sort((a, b) => {
+          const scoreA = a.improvement * (a.noveltyScore ?? 0.5) * (a.learningValue ?? 0.5);
+          const scoreB = b.improvement * (b.noveltyScore ?? 0.5) * (b.learningValue ?? 0.5);
+          return scoreB - scoreA;
+        })
+        .slice(0, 5);
+      prompt += `## What works (from experience buffer):\n`;
+      prompt += topExperiences.map(e =>
+        `- Pattern ${this.diversityManager.extractPatternSignature(e.expression)} improved by ${e.improvement.toFixed(3)}${e.noveltyScore ? ` (novelty: ${(e.noveltyScore * 100).toFixed(0)}%)` : ''}`
+      ).join('\n');
+      prompt += '\n\n';
+    }
 
-      // Include correlation feedback (rolling summary of recent rejections)
-      const correlationContext = this.diversityManager.getCorrelationSummary();
-      if (correlationContext) {
-        prompt += correlationContext;
-        prompt += '\n';
-        prompt += 'Note: These patterns correlated with existing portfolio. Find alternative operators, data fields, or neutralization approaches.\n\n';
-      }
-
-      // Gap 8: Regime-aware context
-      prompt += buildRegimeContext(this.state.macroRegime, this.state.livingAlphas.slice(0, 10).map(a => ({
-        alphaId: a.id,
-        suitability: a.sharpe > 0 ? Math.min(1, a.sharpe / 3) : 0,
-      })));
+    // Include correlation feedback (rolling summary of recent rejections)
+    const correlationContext = this.diversityManager.getCorrelationSummary();
+    if (correlationContext) {
+      prompt += correlationContext;
       prompt += '\n';
+      prompt += 'Note: These patterns correlated with existing portfolio. Find alternative operators, data fields, or neutralization approaches.\n\n';
+    }
 
-     prompt += `## Strategy: ${outerResult.strategy} (mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%)\n\n`;
-     prompt += this.buildSourceGuidanceBlock(
+    // Gap 8: Regime-aware context
+    prompt += buildRegimeContext(this.state.macroRegime, this.state.livingAlphas.slice(0, 10).map(a => ({
+      alphaId: a.id,
+      suitability: a.sharpe > 0 ? Math.min(1, a.sharpe / 3) : 0,
+    })));
+    prompt += '\n';
+
+    prompt += `## Strategy: ${outerResult.strategy} (mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%)\n\n`;
+    prompt += this.buildSourceGuidanceBlock(
       `expression generation ${style} ${outerResult.strategy} ${styleConfig.datasets.join(' ')} ${styleConfig.operators.join(' ')}`
-     );
-     prompt += `Generate ${count} NEW, DIVERSE expressions. Be creative but valid.`;
+    );
+    prompt += `Generate ${count} NEW, DIVERSE expressions. Be creative but valid.`;
 
     return prompt;
   }
 
-   private buildSourceGuidanceBlock(query: string): string {
-     // Prepare context for better source selection
-     const context = {
-       currentStyle: this.state.config?.datasetRotation?.[0] || undefined,
-       recentTopics: this.state.generationStats
-         .slice(-3)
-         .map(g => g.dominantCategory)
-         .filter((cat, index, self) => self.indexOf(cat) === index) // Remove duplicates
-     };
-     
-     const { promptBlock, selectedIds, estimatedTokens } = formatSourceContextForPrompt(query, 5, 300, context);
-     this.addRetrievalTrace('source_guidance', selectedIds, estimatedTokens);
-     const sources = getConfiguredSourcePaths();
-     return `\n\n${promptBlock}\nSource files: ${sources.join(' | ')}\n`;
-   }
+  private buildSourceGuidanceBlock(query: string): string {
+    // Prepare context for better source selection
+    const context = {
+      currentStyle: undefined,
+      recentTopics: this.state.generationStats
+        .slice(-3)
+        .map(g => g.dominantCategory)
+        .filter((cat, index, self) => self.indexOf(cat) === index) // Remove duplicates
+    };
+
+    const { promptBlock, selectedIds, estimatedTokens } = formatSourceContextForPrompt(query, 5, 300, context);
+    this.addRetrievalTrace('source_guidance', selectedIds, estimatedTokens);
+    const sources = getConfiguredSourcePaths();
+    return `\n\n${promptBlock}\nSource files: ${sources.join(' | ')}\n`;
+  }
 
   // --- Candidate Quality Ranker (Generate many -> rank -> simulate few) ---
 
@@ -2318,19 +2318,6 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
    * Implements experience prioritization to focus on high-information experiences.
    */
   private addToExperienceBuffer(candidate: AlphaCandidate, alpha: WQAlpha): void {
-    const context = {
-      currentStyle: this.state.config?.datasetRotation?.[0] || undefined,
-      recentTopics: this.state.generationStats
-        .slice(-3)
-        .map(g => g.dominantCategory)
-        .filter((cat, index, self) => self.indexOf(cat) === index)
-    };
-    
-    // Use previous experience if there was a modification
-    const recentCorrection = this.state.feedbackHistory.find(
-      f => f.candidateId === candidate.id && f.loop === 'inner' && f.action === 'correction'
-    );
-
     // Compute novelty score by comparing expression to existing hypotheses in source memory
     const noveltyScore = this.computeExperienceNovelty(candidate.expression);
     
@@ -3249,7 +3236,7 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
     const dist = this.diversityManager.getCategoryCounts();
     let max = 0;
     let dominant = 'Unknown';
-    for (const [cat, count] of Object.entries(dist)) {
+    for (const [cat, count] of Object.entries(dist) as [string, number][]) {
       if (count > max) { max = count; dominant = cat; }
     }
     return dominant;
