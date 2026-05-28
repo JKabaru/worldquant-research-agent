@@ -19,6 +19,8 @@ const SOURCE_PATHS = {
   expectedReturns: 'C:\\Users\\joseph\\Downloads\\Expected Returns PDF.pdf',
   computationalParadigms:
     'C:\\Users\\joseph\\Downloads\\Computational Paradigms in Systemat world quant.txt',
+  operationalGuide:
+    'E:\\Users\\Public\\worldquant-research-agent\\Deconstructing the WorldQuant Brain_ An Operational Guide to Obscure Data, Failed Alphas, and Successful Expressions.md',
 } as const;
 
 const DISTILLED_SNIPPETS: SourceSnippet[] = [
@@ -553,6 +555,97 @@ const DISTILLED_SNIPPETS: SourceSnippet[] = [
     text: 'High discretionary accruals coupled with sudden decline in order book depth signals institutional investors exiting ahead of negative earnings revision, combining fundamental and microstructure for predictive edge.',
     tags: ['accruals', 'microstructure', 'order_book', 'earnings'],
   },
+  // ============================================================
+  // Deconstructing the WorldQuant Brain — Operational Guide
+  // ============================================================
+  {
+    id: 'og_1',
+    sourceId: 'operational_guide',
+    sourcePath: SOURCE_PATHS.operationalGuide,
+    topic: 'news12.sentiment_score_rolling7d',
+    text: 'news12.sentiment_score_rolling7d is a 7-day rolling average of news-derived sentiment, designed to smooth short-term noise and capture persistent sentiment trends. Suitable for medium-frequency strategies rather than high-frequency ones.',
+    tags: ['news12', 'sentiment', 'rolling_average', 'data_fields'],
+  },
+  {
+    id: 'og_2',
+    sourceId: 'operational_guide',
+    sourcePath: SOURCE_PATHS.operationalGuide,
+    topic: 'analyst4.rating_change_count_3m',
+    text: 'analyst4.rating_change_count_3m counts analyst rating changes over three months, serving as a proxy for consensus shifts or uncertainty. Spikes indicate elevated disagreement among analysts, often preceding price moves.',
+    tags: ['analyst4', 'analyst', 'consensus', 'data_fields'],
+  },
+  {
+    id: 'og_3',
+    sourceId: 'operational_guide',
+    sourcePath: SOURCE_PATHS.operationalGuide,
+    topic: 'model51.volatility_skew_ratio',
+    text: 'model51.volatility_skew_ratio is the ratio of implied volatility skew to historical volatility, capturing market expectations of tail risk relative to realized price fluctuations. Useful for tail-risk hedging signals.',
+    tags: ['model51', 'volatility', 'skew', 'tail_risk', 'data_fields'],
+  },
+  {
+    id: 'og_4',
+    sourceId: 'operational_guide',
+    sourcePath: SOURCE_PATHS.operationalGuide,
+    topic: 'fnd6_newqv1300 data fields',
+    text: 'fnd6_newqv1300 fields include alternative fundamental metrics like fnd6_newqv1300_.exec_sns_activity_momentum (momentum of exec social media activity) and fnd6_newqv1300_.supply_chain_resilience_index (proprietary supply-chain disruption resilience). These are dimensionless ratios, safe to combine after rank normalization.',
+    tags: ['fnd6_newqv1300', 'fundamental', 'alternative_data', 'exec_sns', 'supply_chain'],
+  },
+  {
+    id: 'og_5',
+    sourceId: 'operational_guide',
+    sourcePath: SOURCE_PATHS.operationalGuide,
+    topic: 'Auto-correlation platform check',
+    text: 'The platform tests for low auto-correlation; highly auto-correlated signals are flagged as slow-moving trends replicable by internal models. rank(ts_delta(field, N)) is the canonical pattern to pass this check — rank() flattens the signal distribution, producing values between 0 and 1 with low auto-correlation. Without rank(), ts_delta often fails.',
+    tags: ['auto_correlation', 'platform_check', 'rank', 'ts_delta', 'signal_quality'],
+  },
+  {
+    id: 'og_6',
+    sourceId: 'operational_guide',
+    sourcePath: SOURCE_PATHS.operationalGuide,
+    topic: 'Alpha construction priority order',
+    text: 'Alpha construction should follow this priority: first ensure it passes platform quality checks (low auto-correlation, sufficient coverage), then minimize turnover, then enhance risk-adjusted returns. group_neutralize(rank(signal), industry) helps with both coverage and auto-correlation by centering signals within each industry.',
+    tags: ['priority', 'quality_checks', 'coverage', 'auto_correlation', 'group_neutralize'],
+  },
+  {
+    id: 'og_7',
+    sourceId: 'operational_guide',
+    sourcePath: SOURCE_PATHS.operationalGuide,
+    topic: 'Blend fast and slow signals',
+    text: 'Multiplying a rank-transformed signal by a slower smoothed signal reduces turnover while retaining predictive power. Example: rank(fundamental_field) * ts_zscore(ts_mean(close, 20)). The 20-day mean provides smooth long-term context, while the fundamental rank adds cross-sectional differentiation.',
+    tags: ['signal_blending', 'multi_timescale', 'turnover_reduction', 'rank', 'ts_mean'],
+  },
+  {
+    id: 'og_8',
+    sourceId: 'operational_guide',
+    sourcePath: SOURCE_PATHS.operationalGuide,
+    topic: 'Multi-component signal pattern',
+    text: 'rank(A) * rank(B) where A and B are uncorrelated signals (e.g., one momentum-based and one value-based) enhances Sharpe ratio through diversification within a single expression. Always normalize each component with rank() before combining.',
+    tags: ['multi_component', 'sharpe_enhancement', 'diversification', 'rank'],
+  },
+  {
+    id: 'og_9',
+    sourceId: 'operational_guide',
+    sourcePath: SOURCE_PATHS.operationalGuide,
+    topic: 'Semantic nesting rule: rank inside ts_mean',
+    text: 'ts_mean(rank(X), N) is logically invalid: rank() produces a changing cross-sectional distribution each day, destroying temporal coherence needed for aggregation. Keep rank() as the outermost operation or apply it to individual components before time-series operators. Similarly, ts_zscore(rank(X), N) is redundant — rank() already normalizes.',
+    tags: ['semantic_error', 'nesting', 'rank', 'ts_mean', 'cross_sectional', 'normalization'],
+  },
+  {
+    id: 'og_10',
+    sourceId: 'operational_guide',
+    sourcePath: SOURCE_PATHS.operationalGuide,
+    topic: 'Unit mismatch failure mode',
+    text: 'Adding a unit-price field (e.g., close) to a ratio field (e.g., fnd6 field) produces a mathematically defined but financially meaningless result that passes silently. Always convert signals to a common scale using rank() or ts_zscore() before combining. rank() is preferred as it produces uniform 0-1 distribution independent of the original unit.',
+    tags: ['unit_mismatch', 'semantic_error', 'normalization', 'rank', 'semantic_safety'],
+  },
+  {
+    id: 'og_11',
+    sourceId: 'operational_guide',
+    sourcePath: SOURCE_PATHS.operationalGuide,
+    topic: 'delay operator and look-ahead bias',
+    text: 'delay(expr, N) shifts a time series forward by N periods to prevent look-ahead bias. N must be a small positive integer constant. Nesting delay calls (e.g., delay(delay(x, 1), 1)) is technically possible but adds complexity without benefit and reduces signal-to-noise.',
+    tags: ['delay', 'look_ahead_bias', 'timing', 'operator_signature'],
+  },
 ];
 
 function estimateTokens(text: string): number {
@@ -567,6 +660,23 @@ function tokenize(text: string): Set<string> {
       .split(/\s+/)
       .filter(t => t.length >= 3)
   );
+}
+
+function isNearDuplicateSnippet(
+  newText: string,
+  existingSnippets: SourceSnippet[],
+  threshold: number = 0.65
+): boolean {
+  const newTokens = tokenize(newText);
+  if (newTokens.size === 0) return false;
+  for (const existing of existingSnippets) {
+    const existingTokens = tokenize(`${existing.topic} ${existing.text} ${existing.tags.join(' ')}`);
+    const intersection = new Set([...newTokens].filter(t => existingTokens.has(t)));
+    const union = new Set([...newTokens, ...existingTokens]);
+    const jaccard = intersection.size / union.size;
+    if (jaccard >= threshold) return true;
+  }
+  return false;
 }
 
 function scoreSnippet(snippet: SourceSnippet, queryTerms: Set<string>): number {
@@ -641,6 +751,7 @@ export function getConfiguredSourcePaths(): string[] {
     SOURCE_PATHS.activePortfolioManagement,
     SOURCE_PATHS.expectedReturns,
     SOURCE_PATHS.computationalParadigms,
+    SOURCE_PATHS.operationalGuide,
   ];
 }
 
