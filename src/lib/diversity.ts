@@ -462,18 +462,6 @@ export class DiversityManager {
     return { pearson, spearman, maxRolling, avgRolling, stability };
   }
 
-  computeAdaptiveThreshold(): number {
-    const totalFingerprints = this.fingerprints.size;
-    const portfolioDiversity = this.computeAggregateCoverage();
-
-    const baseThreshold = this.maxCorrelation;
-    // Threshold gets STRICTER (lower) as portfolio grows — not looser
-    const diversityPenalty = Math.min(0.10, (totalFingerprints / 100) * 0.02);
-    const penalty = portfolioDiversity > 0.5 ? 0.05 : 0;
-
-    return Math.max(0.25, Math.min(0.4, baseThreshold - penalty - diversityPenalty));
-  }
-
   /**
    * PCA-based Pre-Simulation Correlation Prediction.
    * Now uses in-memory Jaccard similarity against submitted WQ alphas
@@ -554,9 +542,9 @@ export class DiversityManager {
   }
 
 /**
-    * Evaluate a candidate against the loaded submitted alphas using
-    * Jaccard token similarity (simple operator/field overlap).
-    * Uses cluster IDs to anonymize topMatches - no alpha IDs exposed.
+    * Evaluate a candidate against ALL submitted alphas using a HARD, FIXED correlation threshold.
+    * One-by-one check: if ANY single submitted alpha exceeds the hard limit, reject immediately.
+    * No adaptive slider, no diversity bonus — this is a hard correlation enforcement gate.
     */
    evaluateCandidateWithSubmittedAlphas(candidate: AlphaCandidate): {
      accepted: boolean;
@@ -565,8 +553,7 @@ export class DiversityManager {
      rejectionReason?: string;
    } {
      const similarities: Array<{ alphaId: string; clusterId: string; similarity: number }> = [];
-     let hardNearDuplicate = false;
-     let hardReasonType = '';
+     const hardThreshold = this.maxCorrelation;
 
      if (this.submittedBaselineIds.size === 0) {
        return {
@@ -606,46 +593,27 @@ export class DiversityManager {
          fieldOverlap * 0.15
        );
        const clusterId = this.getOrCreateClusterId(alphaId);
-       similarities.push({ alphaId, clusterId, similarity });
 
-       if (
-         (semantic >= 0.72 && structural >= 0.72) ||
-         (operatorOverlap >= 0.70 && fieldOverlap >= 0.85) ||
-         normalizedSimilarity >= 0.82
-       ) {
-         hardNearDuplicate = true;
-         if (semantic >= 0.72 && structural >= 0.72) {
-           hardReasonType = 'semantic_and_structural';
-         } else if (operatorOverlap >= 0.70 && fieldOverlap >= 0.85) {
-           hardReasonType = 'operator_field_overlap';
-         } else {
-           hardReasonType = 'normalized_expression';
-         }
+       // ONE-BY-ONE hard check: if ANY single submitted alpha exceeds the hard limit, reject immediately
+       if (similarity >= hardThreshold || normalizedSimilarity >= hardThreshold) {
+         similarities.push({ alphaId, clusterId, similarity });
+         return {
+           accepted: false,
+           averageSimilarity: similarity,
+           topMatches: [{ clusterId, similarity }],
+           rejectionReason:
+             `Correlated with ${clusterId} (${(similarity * 100).toFixed(1)}%) — hard limit is ${(hardThreshold * 100).toFixed(1)}%`,
+         };
        }
+       similarities.push({ alphaId, clusterId, similarity });
      }
 
      similarities.sort((a, b) => b.similarity - a.similarity);
 
-     const top3 = similarities.slice(0, 3);
-     const maxSimilarity = similarities.length > 0 ? similarities[0].similarity : 0;
-     const adaptiveThreshold = this.computeAdaptiveThreshold();
-     const accepted = !hardNearDuplicate && maxSimilarity < adaptiveThreshold;
-
-     const rejectionTypes: Record<string, string> = {
-       semantic_and_structural: 'High semantic + structural similarity with existing patterns',
-       operator_field_overlap: 'Similar operator-field combination to existing alphas',
-       normalized_expression: 'Near-duplicate expression structure',
-     };
-
      return {
-       accepted,
-       averageSimilarity: maxSimilarity,
-       topMatches: top3.map(s => ({ clusterId: s.clusterId, similarity: s.similarity })),
-       rejectionReason: accepted ? undefined : (
-         hardNearDuplicate
-           ? rejectionTypes[hardReasonType] || 'Near-duplicate detected'
-           : `Similarity ${(maxSimilarity * 100).toFixed(1)}% exceeds threshold ${(adaptiveThreshold * 100).toFixed(1)}%`
-       ),
+       accepted: true,
+       averageSimilarity: similarities.length > 0 ? similarities[0].similarity : 0,
+       topMatches: similarities.slice(0, 3).map(s => ({ clusterId: s.clusterId, similarity: s.similarity })),
      };
    }
 
