@@ -860,16 +860,23 @@ export class DiversityManager {
   }
 
   /**
-   * Extract a compact pattern signature from an expression.
-   * Format: "op1+op2+op3 × field1+field2"
-   * Purpose: Guide LLM away from correlated operator/field combinations without showing the exact expression.
+   * Extract a categorized structural signature from an expression.
+   * Format: "S{2ts+2cs}×D{fundamental+price/vol}"
+   * Purpose: Guide LLM toward successful operator-category × data-domain combinations
+   * without exposing the exact expression.
    *
    * Extraction strategy:
-   * - Operators: lowercase identifiers followed by '(' (e.g., rank, ts_delta)
-   * - Data fields: other identifiers (e.g., close, volume, sector) that are not operators and not numbers.
+   * - Operators are classified into categories (time-series, cross-sectional, group, control flow, vector)
+   * - Data fields are classified into domains (fundamental, price/vol, analyst, news/sentiment, options, universe)
+   * - Output is a count of unique operators per category × detected data domains
    */
   extractPatternSignature(expression: string): string {
-    // Extract operators (function names)
+    const timeSeriesOps = new Set(['ts_delta','ts_mean','ts_decay_linear','ts_rank','ts_zscore','ts_regression','ts_delay','ts_backfill','ts_std_dev','ts_skewness','ts_kurtosis','ts_entropy','ts_moment','ts_av_diff','ts_ir','ts_returns','ts_min','ts_arg_max','ts_arg_min','ts_sum','ts_corr']);
+    const crossSectionalOps = new Set(['rank','zscore','normalize','winsorize','scale']);
+    const groupOps = new Set(['group_rank','group_neutralize','group_zscore','group_backfill','group_mean']);
+    const controlFlowOps = new Set(['trade_when','if_else','bucket','hump','signed_power','sigmoid','power']);
+    const vectorOps = new Set(['vec_avg','vec_count','vec_sum']);
+
     const opRegex = /\b([a-z_][a-z0-9_]*)\s*\(/g;
     const operators: string[] = [];
     let match;
@@ -877,26 +884,41 @@ export class DiversityManager {
       operators.push(match[1]);
     }
 
-    // Extract all word tokens
-    const allWords = expression.match(/\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g) || [];
-    const fieldsSet = new Set<string>();
-    for (const word of allWords) {
-      // Skip if it's an operator
-      if (operators.includes(word)) continue;
-      // Skip numeric literals
-      if (/^\d+$/.test(word)) continue;
-      // Accept as data field (lowercase for consistency)
-      fieldsSet.add(word.toLowerCase());
+    const uniqueOps = [...new Set(operators)];
+    let tsCount = 0, csCount = 0, gCount = 0, cfCount = 0;
+    for (const op of uniqueOps) {
+      if (timeSeriesOps.has(op)) tsCount++;
+      else if (crossSectionalOps.has(op)) csCount++;
+      else if (groupOps.has(op)) gCount++;
+      else if (controlFlowOps.has(op)) cfCount++;
     }
-    const fields = Array.from(fieldsSet).slice(0, 3);
 
-    const opPart = operators.slice(0, 3).join('+');
-    const fieldPart = fields.slice(0, 3).join('+');
+    const parts: string[] = [];
+    if (tsCount > 0) parts.push(`${tsCount}ts`);
+    if (csCount > 0) parts.push(`${csCount}cs`);
+    if (gCount > 0) parts.push(`${gCount}grp`);
+    if (cfCount > 0) parts.push(`${cfCount}cf`);
 
-    if (opPart && fieldPart) {
-      return `${opPart} × ${fieldPart}`;
-    }
-    return opPart || fieldPart;
+    // Detect data domains
+    const fieldDomains: string[] = [];
+    const lower = expression.toLowerCase();
+    if (/\b(cashflow_op|assets|debt_lt|ebit|capex|sharesout|sales_growth|revenue|earnings|book_value|roe|gross_margin|enterprise_value|operating_income|accruals|retained_earnings|interest_expense|ebitda|pe_ratio|pb_ratio)\b/.test(lower))
+      fieldDomains.push('fundamental');
+    if (/\b(close|open|high|low|volume|returns|vwap|adv20)\b/.test(lower))
+      fieldDomains.push('price/vol');
+    if (/\b(cap|market|sector|industry|subindustry)\b/.test(lower))
+      fieldDomains.push('universe');
+    if (/\b(est_eps|etz_eps|est_cashflow_op|est_capex)\b/.test(lower))
+      fieldDomains.push('analyst');
+    if (/\b(news_pct|news_max|nws12|scl15|scl12)\b/.test(lower))
+      fieldDomains.push('news/sentiment');
+    if (/\b(implied_volatility|pcr_oi)\b/.test(lower))
+      fieldDomains.push('options');
+
+    const opDesc = parts.join('+') || `${uniqueOps.slice(0, 2).join('+')}`;
+    const fieldDesc = fieldDomains.join('+') || 'mixed';
+
+    return `S{${opDesc}}×D{${fieldDesc}}`;
   }
 
 /**

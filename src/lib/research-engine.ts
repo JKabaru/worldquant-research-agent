@@ -1570,7 +1570,7 @@ Each hypothesis should be 1-2 sentences of plain English.`;
           { role: 'user', content: prompt },
         ],
         config.modelId,
-        0.4,
+        0.6,
         4096,
         { type: 'json_object' }
       );
@@ -1722,11 +1722,94 @@ ${styleConfig.description}
 3. Example valid: rank(ts_delta(close, 5)) / rank(ts_std_dev(volume, 20))
 4. Example multi-line: "signal = ts_mean(close, 10); result = rank(signal)"
 5. Cross-sectional operators (rank, zscore) should NOT be nested inside time-series functions
-6. Do NOT use operators you are uncertain about. Stick to well-known ones.
+6. Do NOT use operators you are uncertain about.
 7. Lookback windows should be reasonable: 5-252 for daily data
 8. For group operators, the second argument must be a grouping field like sector, industry, subindustry
 9. Always end with a ranking or normalization function for the final signal
-10. Do NOT make up data fields. Use only common fields like: close, open, high, low, volume, returns, cap, sharesout, assets, revenue, earnings, cashflow_op, debt_lt, sector, industry, subindustry, market
+10. Do NOT make up data fields. Use ONLY fields from these datasets:
+
+### pv13 (Price/Volume)
+close, open, returns, volume, cap, adv20, vwap
+
+### fundamental6 / fundamental2 (Accounting & Valuation)
+sales_growth, ebit, capex, assets, debt_lt, sharesout, cashflow_op
+
+### analyst4 (Analyst Estimates)
+est_eps, etz_eps, est_cashflow_op, est_capex
+
+### model51 / options (Implied Volatility & Models)
+implied_volatility_call_270, implied_volatility_put_270, pcr_oi_270
+
+### news12 / sentiment (News & Social)
+news_pct_1min, news_max_up_ret, nws12_afterhsz_1_minute, scl15_d1_sentiment
+
+### fnd6_newqv1300_* (New Fundamentals)
+fnd6_newqv1300_ivltq
+
+Construct fundamental ratios by combining raw fields (e.g., cashflow_op/cap, debt_lt/assets, volume/adv20, assets/close). Do NOT make up field names.
+
+## COMMON FUNDAMENTAL RATIOS (combine two fields):
+- cashflow_op / cap — cash flow yield
+- debt_lt / assets — leverage ratio
+- revenue / cashflow_op — cash conversion efficiency
+- assets / close — asset-to-price
+- debt_lt / cap — debt-to-market-cap
+- volume / adv20 — relative volume
+- volume / sharesout — turnover ratio
+- (close - vwap) / vwap — price relative to VWAP
+- ebit / capex — return on capex proxy
+- est_cashflow_op - est_capex — free cash flow proxy
+
+## VOLUME & OPERATOR TECHNIQUES:
+- **Turnover reduction**: ts_decay_linear(x, d) smooths signals and reduces daily trading turnover. Apply after noisy operators.
+- **Outlier control**: winsorize(x, std=4) clamps extreme values to 4 std devs — normalizes spike reactions without discarding signal.
+- **Vector aggregation**: Vector fields (multiple events/day) need vec_avg(x), vec_count(x), or vec_sum(x) before use with other operators.
+- **Targeted execution**: trade_when(condition, signal, fallback) activates alpha only when condition is met, reducing unnecessary trading.
+- **Granular neutralization**: group_neutralize(x, group) inside expressions allows custom grouping logic. Set platform Neutralization to "None".
+- **Manual NaN handling**: Leave NaN Handling 'Off' and use if_else(is_nan(expr), fallback, expr) for explicit control.
+
+## FULL OPERATOR REFERENCE (grouped by category):
+
+### Time-Series Operators
+- ts_delta(x, d) — period-over-period difference
+- ts_mean(x, d) — rolling simple average
+- ts_decay_linear(x, d) — linearly weighted moving average (reduces turnover)
+- ts_rank(x, d) — time-series rank percentile
+- ts_zscore(x, d) — rolling z-score (division-by-zero if std=0)
+- ts_regression(y, x, d, lag, rettype) — regression slope/intercept/r²
+- ts_backfill(x, d) — forward-fill NaN values
+- ts_delay(x, d) — value from d days ago
+- ts_std_dev(x, d) — rolling standard deviation
+- ts_av_diff(x, d) — deviation from rolling average
+- ts_corr(x, y, d) — rolling correlation
+- ts_sum(x, d) — rolling sum
+- ts_arg_max(x, d) / ts_arg_min(x, d) — days since max/min
+
+### Cross-Sectional Operators
+- rank(x) — percentile rank across universe (0.0 to 1.0)
+- zscore(x) — cross-sectional std deviations from mean
+- normalize(x, useStd, limit) — center by subtracting market mean
+- winsorize(x, std=4) — clamp outliers to N std devs
+- scale(x, scale=1) — scale so abs sum = book size
+
+### Group Operators
+- group_rank(x, group) — rank within group (industry/sector/subindustry)
+- group_neutralize(x, group) — subtract group mean
+- group_zscore(x, group) — z-score within group
+- group_backfill(x, group, d) — fill NaN within group via winsorized mean
+- group_mean(x, weight, group) — harmonic mean within group
+
+### Control Flow & Transformational
+- trade_when(condition, signal, fallback) — conditional execution
+- if_else(cond, t, f) — ternary logic
+- bucket(rank(x), range) — custom group bucketing
+- signed_power(x, y) — distribution shaping
+- hump(x, d) — hump-shaped weighting
+
+### Vector Operators (for multi-event/day fields)
+- vec_avg(x) — mean of vector elements
+- vec_count(x) — number of vector elements
+- vec_sum(x) — sum of vector elements
 
 ## FORBIDDEN PATTERNS:
 - rank() inside ts_rank() or any ts_*() function
@@ -1801,7 +1884,7 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
   }
 
   private buildSourceGuidanceBlock(query: string): string {
-    const { promptBlock, selectedIds, estimatedTokens } = formatSourceContextForPrompt(query, 5, 300);
+    const { promptBlock, selectedIds, estimatedTokens } = formatSourceContextForPrompt(query, 7, 450);
     this.addRetrievalTrace('source_guidance', selectedIds, estimatedTokens);
     const sources = getConfiguredSourcePaths();
     return `\n\n${promptBlock}\nSource files: ${sources.join(' | ')}\n`;
