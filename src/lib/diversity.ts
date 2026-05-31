@@ -13,6 +13,7 @@ interface AlphaFingerprint {
   category: string;
   style: StylePremia;
   structuralFingerprint?: StructuralFingerprint;
+  skeleton?: string;
 }
 
 interface StructuralFingerprint {
@@ -116,6 +117,7 @@ export class DiversityManager {
       category,
       style,
       structuralFingerprint,
+      skeleton: this.extractOperatorSkeleton(expression),
     });
 
     // Update counts
@@ -205,6 +207,57 @@ export class DiversityManager {
       .replace(/\d+(\.\d+)?/g, 'N')
       .replace(/"[^"]*"/g, '"S"')
       .replace(/'[^']*'/g, "'S'");
+  }
+
+  /**
+   * Extract a canonical operator skeleton from an expression by:
+   * 1. Stripping all field names → F
+   * 2. Replacing all numeric literals → N
+   * 3. Sorting top-level * operands (commutative invariance)
+   * This captures the strategy PATTERN without being fooled by different field names.
+   */
+  private extractOperatorSkeleton(expression: string): string {
+    const lower = expression.toLowerCase().replace(/\s+/g, '');
+    let skeleton = lower.replace(/\d+(\.\d+)?/g, 'N');
+
+    // Identify all unique operator names (identifiers followed by '(')
+    const opRegex = /\b([a-z_][a-z0-9_]*)\s*\(/g;
+    const operatorNames = new Set<string>();
+    let match;
+    while ((match = opRegex.exec(skeleton)) !== null) {
+      operatorNames.add(match[1]);
+    }
+
+    // Replace all non-operator identifiers with F
+    const skip = new Set(['true', 'false', 'nan', 'none', 'and', 'or', 'not', 'inf']);
+    const identRegex = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+    skeleton = skeleton.replace(identRegex, (ident) => {
+      const lowerIdent = ident.toLowerCase();
+      if (operatorNames.has(lowerIdent)) return ident;
+      if (skip.has(lowerIdent)) return ident;
+      if (/^\d+$/.test(lowerIdent)) return ident;
+      return 'F';
+    });
+
+    // Sort top-level * terms for commutativity: A*B*C → A*B*C (same regardless of original order)
+    const terms: string[] = [];
+    let depth = 0;
+    let current = '';
+    for (let i = 0; i < skeleton.length; i++) {
+      const ch = skeleton[i];
+      if (ch === '(') depth++;
+      else if (ch === ')') depth--;
+      if (depth === 0 && ch === '*') {
+        terms.push(current);
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    if (current) terms.push(current);
+    terms.sort();
+
+    return terms.join('*');
   }
 
   private trigramDiceSimilarity(a: string, b: string): number {
@@ -299,11 +352,39 @@ export class DiversityManager {
 
   private generatePatternSignatureDynamic(expression: string, operators: string[]): string {
     let sig = expression;
-    
+
     const uniqueOps = [...new Set(operators)];
+    // Sort longest-first so nested operators are replaced inner-first
+    uniqueOps.sort((a, b) => b.length - a.length);
+
     for (const op of uniqueOps) {
-      const regex = new RegExp(`${op}\\s*\\([^)]+\\)`, 'gi');
-      sig = sig.replace(regex, `${op.toUpperCase()}(X)`);
+      const opLower = op.toLowerCase();
+      const searchRegex = new RegExp(`${opLower}\\s*\\(`, 'gi');
+
+      // Collect all match positions, process right-to-left to avoid index shifting
+      const positions: number[] = [];
+      let m;
+      while ((m = searchRegex.exec(sig)) !== null) {
+        positions.push(m.index);
+      }
+      positions.sort((a, b) => b - a);
+
+      for (const startIdx of positions) {
+        const parenIdx = sig.indexOf('(', startIdx);
+        if (parenIdx === -1) continue;
+
+        // Find matching close paren with depth tracking (handles nested calls)
+        let depth = 1;
+        let i = parenIdx + 1;
+        while (i < sig.length && depth > 0) {
+          if (sig[i] === '(') depth++;
+          else if (sig[i] === ')') depth--;
+          if (depth > 0) i++;
+        }
+        if (depth === 0) {
+          sig = sig.slice(0, startIdx) + op.toUpperCase() + '(X)' + sig.slice(i + 1);
+        }
+      }
     }
 
     sig = sig.replace(/volume/gi, 'VOL');
@@ -535,6 +616,7 @@ export class DiversityManager {
         category: this.classifyCategory(alpha.code),
         style: this.classifyStyle(alpha.code),
         structuralFingerprint: this.extractStructuralFingerprint(alpha.code),
+        skeleton: this.extractOperatorSkeleton(alpha.code),
       });
       this.wqBaselineAlphaIds.add(alpha.id);
       this.submittedBaselineIds.add(alpha.id);
@@ -542,9 +624,11 @@ export class DiversityManager {
   }
 
 /**
-    * Evaluate a candidate against ALL submitted alphas using a HARD, FIXED correlation threshold.
-    * One-by-one check: if ANY single submitted alpha exceeds the hard limit, reject immediately.
-    * No adaptive slider, no diversity bonus — this is a hard correlation enforcement gate.
+    * Evaluate a candidate against ALL known fingerprints (submitted + in-session) using a HARD,
+    * FIXED correlation threshold. One-by-one check with TWO metrics:
+    * 1) Raw composite similarity (operators + fields + structure)
+    * 2) Operator-skeleton trigram similarity (field-stripped + commutative sort)
+    * If EITHER metric exceeds the hard limit for ANY single fingerprint, reject immediately.
     */
    evaluateCandidateWithSubmittedAlphas(candidate: AlphaCandidate): {
      accepted: boolean;
@@ -564,13 +648,16 @@ export class DiversityManager {
        };
      }
 
+     const candidateSkeleton = this.extractOperatorSkeleton(candidate.expression);
      const candidateStructural = this.extractStructuralFingerprint(candidate.expression);
      const normalizedCandidate = this.normalizeExpressionForComparison(candidate.expression);
-     for (const alphaId of this.submittedBaselineIds) {
-       const fp = this.fingerprints.get(alphaId);
+
+     // Check against ALL known fingerprints (submitted WQ alphas + in-session accepted alphas)
+     for (const [fpKey, fp] of this.fingerprints) {
        if (!fp) continue;
        if (fp.fingerprint === candidate.fingerprint) continue;
 
+       // --- Raw composite similarity (operator tokens + field tokens + structure) ---
        const semantic = this.computeSemanticSimilarity(candidate.expression, fp.expression);
        const structural = fp.structuralFingerprint
          ? this.computeStructuralSimilarity(candidateStructural, fp.structuralFingerprint)
@@ -582,9 +669,6 @@ export class DiversityManager {
        const operatorOverlap = this.jaccardSimilarity(candidateOps, baselineOps);
        const fieldOverlap = this.jaccardSimilarity(candidateFields, baselineFields);
 
-       const normalizedBaseline = this.normalizeExpressionForComparison(fp.expression);
-       const normalizedSimilarity = this.trigramDiceSimilarity(normalizedCandidate, normalizedBaseline);
-
        const similarity = Math.min(
          1,
          semantic * 0.4 +
@@ -592,20 +676,30 @@ export class DiversityManager {
          operatorOverlap * 0.15 +
          fieldOverlap * 0.15
        );
-       const clusterId = this.getOrCreateClusterId(alphaId);
 
-       // ONE-BY-ONE hard check: if ANY single submitted alpha exceeds the hard limit, reject immediately
-       if (similarity >= hardThreshold || normalizedSimilarity >= hardThreshold) {
-         similarities.push({ alphaId, clusterId, similarity });
+       // --- Operator-skeleton similarity (field-stripped + commutative sort) ---
+       // Catches same-strategy-different-fields patterns
+       const fpSkeleton = fp.skeleton || this.extractOperatorSkeleton(fp.expression);
+       const skeletonSimilarity = this.trigramDiceSimilarity(candidateSkeleton, fpSkeleton);
+
+       // Use the maximum of raw and skeleton similarity — either one can flag correlation
+       const maxSimilarity = Math.max(similarity, skeletonSimilarity);
+
+       const clusterId = this.getOrCreateClusterId(fpKey);
+
+       // ONE-BY-ONE hard check: if ANY single fingerprint exceeds the hard limit, reject immediately
+       if (maxSimilarity >= hardThreshold) {
+         const reasonMetric = skeletonSimilarity > similarity ? 'operator-skeleton' : 'raw-composite';
          return {
            accepted: false,
-           averageSimilarity: similarity,
-           topMatches: [{ clusterId, similarity }],
+           averageSimilarity: maxSimilarity,
+           topMatches: [{ clusterId, similarity: maxSimilarity }],
            rejectionReason:
-             `Correlated with ${clusterId} (${(similarity * 100).toFixed(1)}%) — hard limit is ${(hardThreshold * 100).toFixed(1)}%`,
+             `Correlated with ${clusterId} (${(maxSimilarity * 100).toFixed(1)}% via ${reasonMetric}) — hard limit is ${(hardThreshold * 100).toFixed(1)}%`,
          };
        }
-       similarities.push({ alphaId, clusterId, similarity });
+
+       similarities.push({ alphaId: fpKey, clusterId, similarity: maxSimilarity });
      }
 
      similarities.sort((a, b) => b.similarity - a.similarity);
@@ -673,6 +767,19 @@ export class DiversityManager {
     if (this.isSemanticallyRedundant(candidate.expression)) {
       reasons.push('Semantically redundant with existing alpha');
       score -= 0.3;
+    }
+
+    // Check operator-skeleton redundancy against all fingerprints using hard threshold
+    const candidateSkeleton = this.extractOperatorSkeleton(candidate.expression);
+    for (const [, fp] of this.fingerprints) {
+      if (!fp || fp.fingerprint === candidate.fingerprint) continue;
+      const fpSkeleton = fp.skeleton || this.extractOperatorSkeleton(fp.expression);
+      const skelSim = this.trigramDiceSimilarity(candidateSkeleton, fpSkeleton);
+      if (skelSim >= this.maxCorrelation) {
+        reasons.push(`Operator-skeleton correlated (${(skelSim * 100).toFixed(1)}%) — hard limit ${(this.maxCorrelation * 100).toFixed(1)}%`);
+        score -= 0.3;
+        break;
+      }
     }
 
     // Categorize candidate
