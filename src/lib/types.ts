@@ -364,6 +364,20 @@ export interface RewardBreakdown {
   totalReward: number;
 }
 
+// --- Phase 5: Behavioral Fingerprint & Diagnostic Types ---
+
+export interface DiagnosticDump {
+  reasonCode: string;
+  timestamp: number;
+}
+
+export interface BehavioralFingerprint {
+  turnover: number;
+  longShortRatio: number;
+  volatility: number;
+  maxPortfolioCorrelation: number;
+}
+
 // --- Multi-Timescale Feedback Types ---
 
 export interface InnerLoopResult {

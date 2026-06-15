@@ -3,7 +3,7 @@
 // Hybrid Persistence: PCA via DuckDB + Parquet data warehouse
 // ============================================================
 
-import { AlphaCandidate, DiversityMetrics, StylePremia, WQAlpha } from './types';
+import { AlphaCandidate, DiversityMetrics, StylePremia, WQAlpha, DiagnosticDump, BehavioralFingerprint } from './types';
 import { getDataWarehouse } from './persistence/data-warehouse';
 
 interface AlphaFingerprint {
@@ -92,14 +92,29 @@ export class DiversityManager {
   // Hard blacklist for expression signatures that slipped through and later proved too correlated.
   private blacklistedPatternSignatures: Set<string> = new Set();
 
+  // Phase 5: Diagnostic dumps — lightweight rolling buffer of rejection reason codes
+  private diagnosticDumps: DiagnosticDump[] = [];
+  private readonly MAX_DIAGNOSTIC_DUMPS = 50;
+
+  // Phase 5: Reversal-strength detector state
+  private reversalAlphaCount = 0;
+  private MAX_REVERSAL_LIMIT: number = 5;
+
+  // Phase 5: Behavioral fingerprints for post-simulation Tier 2 comparison
+  private behavioralFingerprints: Map<string, BehavioralFingerprint> = new Map();
+
   constructor(config: {
     maxCorrelation?: number;
     maxPerCategory?: number;
     maxPerStyle?: number;
+    maxReversalLimit?: number;
   } = {}) {
     this.maxCorrelation = config.maxCorrelation || 0.35;
     this.maxPerCategory = config.maxPerCategory || 50;
     this.maxPerStyle = config.maxPerStyle || 30;
+    if (config.maxReversalLimit !== undefined) {
+      this.MAX_REVERSAL_LIMIT = config.maxReversalLimit;
+    }
   }
 
   setMaxCorrelation(threshold: number): void {
@@ -123,6 +138,11 @@ export class DiversityManager {
     // Update counts
     this.categoryCounts.set(category, (this.categoryCounts.get(category) || 0) + 1);
     this.styleCounts.set(style, (this.styleCounts.get(style) || 0) + 1);
+
+    // Track reversal alpha count
+    if (this.isReversalDominated(expression)) {
+      this.reversalAlphaCount++;
+    }
   }
 
   isDuplicate(fingerprint: string): boolean {
@@ -157,6 +177,21 @@ export class DiversityManager {
     return false;
   }
 
+  // Phase 5: Factor overlap — Jaccard similarity of data field names against stored fingerprints
+  computeFactorOverlap(expression: string): number {
+    const candidateFields = new Set(this.extractFieldNames(expression));
+    if (candidateFields.size === 0) return 0;
+    let maxOverlap = 0;
+    for (const fp of this.fingerprints.values()) {
+      const existingFields = new Set(fp.structuralFingerprint?.fields || this.extractFieldNames(fp.expression));
+      const intersection = [...candidateFields].filter(f => existingFields.has(f)).length;
+      const union = new Set([...candidateFields, ...existingFields]).size;
+      const overlap = union > 0 ? intersection / union : 0;
+      if (overlap > maxOverlap) maxOverlap = overlap;
+    }
+    return maxOverlap;
+  }
+
   private tokenize(expr: string): string[] {
     // Extract operators, data fields and window constants as tokens.
     const tokens: string[] = [];
@@ -189,6 +224,26 @@ export class DiversityManager {
     }
 
     return tokens;
+  }
+
+  private extractFieldNames(expression: string): string[] {
+    const fieldRegex = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+    const opNames = new Set<string>();
+    const opRegex = /\b([a-z_]+)\s*\(/g;
+    let match;
+    while ((match = opRegex.exec(expression)) !== null) {
+      opNames.add(match[1].toLowerCase());
+    }
+    const skip = new Set(['true', 'false', 'nan', 'none', 'and', 'or', 'not', 'inf', 'add', 'multiply', 'subtract', 'divide', 'power', 'abs', 'max', 'min', 'if_else', 'trade_when', 'signed_power', 'log', 'sqrt', 'sigmoid', 'hump', 'bucket', 'vec_avg', 'vec_sum', 'vec_count', 'inst_tvr', 'humpdecay', 'scale_down', 'reverse', 'inverse', 'scale', 'winsorize', 'normalize']);
+    const fields = new Set<string>();
+    while ((match = fieldRegex.exec(expression)) !== null) {
+      const ident = match[1].toLowerCase();
+      if (skip.has(ident)) continue;
+      if (opNames.has(ident)) continue;
+      if (/^\d+$/.test(ident)) continue;
+      fields.add(ident);
+    }
+    return [...fields];
   }
 
   private jaccardSimilarity<T>(a: Iterable<T>, b: Iterable<T>): number {
@@ -283,6 +338,32 @@ export class DiversityManager {
     return (2 * shared) / (ga.length + gb.length);
   }
 
+  // --- Phase 5: Reversal-Strength Detector ---
+
+  isReversalDominated(expression: string): boolean {
+    const lower = expression.toLowerCase().replace(/\s+/g, '');
+    const patterns = [
+      /^-1\s*\*\s*rank\(/,
+      /^-\s*rank\(/,
+      /^-\s*ts_rank\(/,
+      /^-\s*normalize\(/,
+      /^-\s*zscore\(/,
+      /^-\s*ts_delta\(/,
+      /^-\s*ts_returns\(/,
+      /rank\(\s*-\s*ts_returns/,
+      /rank\(\s*-\s*ts_delta/,
+      /^-1\s*\*\s*normalize/,
+      /^-1\s*\*\s*zscore/,
+    ];
+    for (const p of patterns) {
+      if (p.test(lower)) return true;
+    }
+    const negationTerms = (lower.match(/-/g) || []).length;
+    const rankTerms = (lower.match(/rank/g) || []).length;
+    if (negationTerms >= 2 && rankTerms >= 1 && /returns|delta/.test(lower)) return true;
+    return false;
+  }
+
   // --- Structural Fingerprint (Phase 1) ---
 
   extractStructuralFingerprint(expression: string): StructuralFingerprint {
@@ -321,8 +402,14 @@ export class DiversityManager {
       }
     }
 
+    // Phase 5: Branch-aware classification for if_else
+    const branchSignature = this.generateBranchSignature(expression);
+
     const arity = this.detectArityDynamic(operatorSequence);
-    const pattern = this.generatePatternSignatureDynamic(expression, operators);
+    let pattern = this.generatePatternSignatureDynamic(expression, operators);
+    if (branchSignature) {
+      pattern = `IF[${branchSignature.cond}]_THEN[${branchSignature.trueBranch}]_ELSE[${branchSignature.falseBranch}]`;
+    }
 
     return {
       pattern,
@@ -401,6 +488,21 @@ export class DiversityManager {
     return sig;
   }
 
+  // Phase 5: Branch-aware classification for if_else expressions
+  private generateBranchSignature(expression: string): { cond: string; trueBranch: string; falseBranch: string } | null {
+    const lower = expression.toLowerCase();
+    if (!lower.includes('if_else')) return null;
+
+    // Extract condition, true branch, false branch from if_else(cond, true, false)
+    const ifElseMatch = lower.match(/if_else\s*\((.+?),\s*(.+?),\s*(.+?)\)\s*$/);
+    if (!ifElseMatch) return null;
+
+    const cond = this.extractOperatorSkeleton(ifElseMatch[1]);
+    const trueBranch = this.extractOperatorSkeleton(ifElseMatch[2]);
+    const falseBranch = this.extractOperatorSkeleton(ifElseMatch[3]);
+    return { cond, trueBranch, falseBranch };
+  }
+
   computeStructuralSimilarity(fp1: StructuralFingerprint, fp2: StructuralFingerprint): number {
     const opSet1 = new Set(fp1.operators);
     const opSet2 = new Set(fp2.operators);
@@ -436,6 +538,29 @@ export class DiversityManager {
 
   addProxyReturns(fingerprint: string, returns: number[]): void {
     this.alphaReturns.set(fingerprint, returns);
+  }
+
+  // Phase 5: Behavioral fingerprint extraction from WQAlpha metrics
+  extractBehavioralFingerprint(alpha: { turnover: number; longCount: number; shortCount: number; volatility: number; correlations?: { prod?: Record<string, number> } }): BehavioralFingerprint {
+    const turnover = Math.min(1, Math.max(0, alpha.turnover));
+    const longShortRatio = alpha.shortCount > 0
+      ? Math.min(alpha.longCount / alpha.shortCount, alpha.shortCount / alpha.longCount)
+      : 1;
+    const volatility = Math.min(1, alpha.volatility / 0.5);
+    const prodCorrs = alpha.correlations?.prod ? Object.values(alpha.correlations.prod).map(v => Math.abs(Number(v))).filter(v => Number.isFinite(v)) : [];
+    const maxPortfolioCorrelation = prodCorrs.length > 0 ? Math.max(...prodCorrs) : 0;
+    return { turnover, longShortRatio, volatility, maxPortfolioCorrelation };
+  }
+
+  // Phase 5: Behavioral similarity via normalized Euclidean distance
+  calculateBehavioralSimilarity(a: BehavioralFingerprint, b: BehavioralFingerprint): number {
+    const squared =
+      Math.pow(a.turnover - b.turnover, 2) +
+      Math.pow(a.longShortRatio - b.longShortRatio, 2) +
+      Math.pow(a.volatility - b.volatility, 2) +
+      Math.pow(a.maxPortfolioCorrelation - b.maxPortfolioCorrelation, 2);
+    const distance = Math.sqrt(squared / 4);
+    return Math.max(0, Math.min(1, 1 - distance));
   }
 
   computePCACoverage(newReturns: number[]): number {
@@ -746,63 +871,165 @@ export class DiversityManager {
     accepted: boolean;
     reasons: string[];
     diversityScore: number;
+    reasonCode?: string;
   } {
     const reasons: string[] = [];
     let score = 1.0;
+    let reasonCode: string | undefined;
 
-    // Hard blacklist check for previously rejected near-duplicate signatures.
+    // 1) Hard blacklist check for previously rejected near-duplicate signatures.
     const patternSignature = this.extractPatternSignature(candidate.expression);
     if (this.blacklistedPatternSignatures.has(patternSignature)) {
       reasons.push('Pattern signature is blacklisted due to prior high-correlation rejection');
       score -= 0.8;
+      reasonCode = 'BLACKLISTED_PATTERN';
     }
 
-    // Check fingerprint duplicate
-    if (this.isDuplicate(candidate.fingerprint)) {
+    // 2) Check fingerprint duplicate
+    if (!reasonCode && this.isDuplicate(candidate.fingerprint)) {
       reasons.push('Duplicate fingerprint detected');
       score -= 0.5;
+      reasonCode = 'DUPLICATE_FINGERPRINT';
     }
 
-    // Check semantic redundancy
-    if (this.isSemanticallyRedundant(candidate.expression)) {
+    // 3) Check semantic redundancy
+    if (!reasonCode && this.isSemanticallyRedundant(candidate.expression)) {
       reasons.push('Semantically redundant with existing alpha');
       score -= 0.3;
+      reasonCode = 'SEMANTIC_REDUNDANCY';
     }
 
-    // Check operator-skeleton redundancy against all fingerprints using hard threshold
-    const candidateSkeleton = this.extractOperatorSkeleton(candidate.expression);
-    for (const [, fp] of this.fingerprints) {
-      if (!fp || fp.fingerprint === candidate.fingerprint) continue;
-      const fpSkeleton = fp.skeleton || this.extractOperatorSkeleton(fp.expression);
-      const skelSim = this.trigramDiceSimilarity(candidateSkeleton, fpSkeleton);
-      if (skelSim >= this.maxCorrelation) {
-        reasons.push(`Operator-skeleton correlated (${(skelSim * 100).toFixed(1)}%) — hard limit ${(this.maxCorrelation * 100).toFixed(1)}%`);
-        score -= 0.3;
-        break;
+    // 4) Check operator-skeleton redundancy against all fingerprints using hard threshold
+    if (!reasonCode) {
+      const candidateSkeleton = this.extractOperatorSkeleton(candidate.expression);
+      for (const [, fp] of this.fingerprints) {
+        if (!fp || fp.fingerprint === candidate.fingerprint) continue;
+        const fpSkeleton = fp.skeleton || this.extractOperatorSkeleton(fp.expression);
+        const skelSim = this.trigramDiceSimilarity(candidateSkeleton, fpSkeleton);
+        if (skelSim >= this.maxCorrelation) {
+          reasons.push(`Operator-skeleton correlated (${(skelSim * 100).toFixed(1)}%) — hard limit ${(this.maxCorrelation * 100).toFixed(1)}%`);
+          score -= 0.3;
+          reasonCode = 'SKELETON_OVERLAP';
+          break;
+        }
       }
     }
 
-    // Categorize candidate
+    // Categorize candidate (needed for budget checks)
     const category = this.classifyCategory(candidate.expression);
     const style = this.classifyStyle(candidate.expression);
 
-    // Check category budget
-    if (!this.canAcceptCategory(category)) {
+    // 5) Check category budget
+    if (!reasonCode && !this.canAcceptCategory(category)) {
       reasons.push(`Category '${category}' budget exceeded (${this.maxPerCategory} max)`);
       score -= 0.2;
+      reasonCode = 'CATEGORY_BUDGET_EXCEEDED';
     }
 
-    // Check style budget
-    if (!this.canAcceptStyle(style)) {
+    // 6) Check style budget
+    if (!reasonCode && !this.canAcceptStyle(style)) {
       reasons.push(`Style '${style}' budget exceeded (${this.maxPerStyle} max)`);
       score -= 0.2;
+      reasonCode = 'STYLE_BUDGET_EXCEEDED';
+    }
+
+    // 7) Phase 5: Reversal-strength detector
+    if (!reasonCode && this.isReversalDominated(candidate.expression)) {
+      if (this.reversalAlphaCount >= this.MAX_REVERSAL_LIMIT) {
+        reasons.push(`Reversal strategy cap reached (${this.MAX_REVERSAL_LIMIT} max)`);
+        score -= 0.5;
+        reasonCode = 'REVERSAL_CAP_REACHED';
+      }
+    }
+
+    // 8) Phase 5: Factor overlap + syntactic similarity (Tier 1 pre-sim formula)
+    if (!reasonCode) {
+      const factorOverlap = this.computeFactorOverlap(candidate.expression);
+      const candidateSkeleton = this.extractOperatorSkeleton(candidate.expression);
+      let maxSyntacticSim = 0;
+      for (const [, fp] of this.fingerprints) {
+        if (!fp || fp.fingerprint === candidate.fingerprint) continue;
+        const fpSkeleton = fp.skeleton || this.extractOperatorSkeleton(fp.expression);
+        const sim = this.trigramDiceSimilarity(candidateSkeleton, fpSkeleton);
+        if (sim > maxSyntacticSim) maxSyntacticSim = sim;
+      }
+
+      // Hard gate: immediate reject if syntactic similarity > 0.90
+      if (maxSyntacticSim > 0.90) {
+        reasons.push(`Syntactic similarity ${(maxSyntacticSim * 100).toFixed(1)}% exceeds hard gate 90%`);
+        score -= 0.5;
+        reasonCode = 'SYNTACTIC_OVERLAP';
+      } else {
+        // Scaled pre-sim formula: 0.6 * factorOverlap + 0.4 * syntacticSimilarity
+        const tier1Score = 0.6 * factorOverlap + 0.4 * maxSyntacticSim;
+        // Max possible pre-sim score = 0.6 (when factor=1, syntax=0). Threshold at 0.55 (>90% of max).
+        if (tier1Score > 0.55) {
+          reasons.push(`Tier 1 pre-sim score ${(tier1Score * 100).toFixed(1)}% exceeds threshold 55% (factor=${(factorOverlap * 100).toFixed(0)}%, syntax=${(maxSyntacticSim * 100).toFixed(0)}%)`);
+          score -= 0.4;
+          reasonCode = tier1Score > 0.7 ? 'FACTOR_SATURATION' : 'TIER1_SIMILARITY';
+        }
+      }
     }
 
     return {
       accepted: reasons.length === 0,
       reasons,
       diversityScore: Math.max(0, score),
+      reasonCode,
     };
+  }
+
+  // Phase 5: Tier 2 Post-Simulation evaluation with full weighted formula
+  evaluatePostSimulation(
+    candidate: AlphaCandidate,
+    alpha: { turnover: number; longCount: number; shortCount: number; volatility: number; correlations?: { prod?: Record<string, number> } }
+  ): {
+    accepted: boolean;
+    reasons: string[];
+    score: number;
+    reasonCode?: string;
+  } {
+    const reasons: string[] = [];
+    const candidateBfp = this.extractBehavioralFingerprint(alpha);
+
+    // Compute behavioral similarity against all stored behavioral fingerprints
+    let behavioralSimilarity = 0;
+    for (const [, existingBfp] of this.behavioralFingerprints) {
+      const sim = this.calculateBehavioralSimilarity(candidateBfp, existingBfp);
+      if (sim > behavioralSimilarity) behavioralSimilarity = sim;
+    }
+
+    // Hard gate: if behavioral similarity > 0.85, reject regardless of combined score
+    if (behavioralSimilarity > 0.85) {
+      reasons.push(`Behavioral similarity ${(behavioralSimilarity * 100).toFixed(1)}% exceeds hard gate 85%`);
+      return { accepted: false, reasons, score: behavioralSimilarity, reasonCode: 'BEHAVIORAL_OVERLAP' };
+    }
+
+    // Factor overlap (reuse Tier 1 computation)
+    const factorOverlap = this.computeFactorOverlap(candidate.expression);
+
+    // Syntactic similarity (reuse)
+    const candidateSkeleton = this.extractOperatorSkeleton(candidate.expression);
+    let syntacticSimilarity = 0;
+    for (const [, fp] of this.fingerprints) {
+      if (!fp || fp.fingerprint === candidate.fingerprint) continue;
+      const fpSkeleton = fp.skeleton || this.extractOperatorSkeleton(fp.expression);
+      const sim = this.trigramDiceSimilarity(candidateSkeleton, fpSkeleton);
+      if (sim > syntacticSimilarity) syntacticSimilarity = sim;
+    }
+
+    // Full weighted formula: 0.5 * behavioral + 0.3 * factor + 0.2 * syntactic
+    const combinedScore = 0.5 * behavioralSimilarity + 0.3 * factorOverlap + 0.2 * syntacticSimilarity;
+
+    if (combinedScore > 0.75) {
+      reasons.push(`Tier 2 combined score ${(combinedScore * 100).toFixed(1)}% exceeds threshold 75% (behavioral=${(behavioralSimilarity * 100).toFixed(0)}%, factor=${(factorOverlap * 100).toFixed(0)}%, syntax=${(syntacticSimilarity * 100).toFixed(0)}%)`);
+      return { accepted: false, reasons, score: combinedScore, reasonCode: 'TIER2_SIMILARITY' };
+    }
+
+    // Store behavioral fingerprint for future comparisons
+    this.behavioralFingerprints.set(candidate.fingerprint, candidateBfp);
+
+    return { accepted: true, reasons, score: combinedScore };
   }
 
   private classifyCategory(expression: string): string {
@@ -904,6 +1131,85 @@ export class DiversityManager {
     if (this.correlationFeedbackQueue.length > 10) {
       this.correlationFeedbackQueue.shift();
     }
+  }
+
+  // Phase 5: Lightweight diagnostic dump — stores only reason codes, no expressions
+  recordDiagnosticDump(reasonCode: string): void {
+    this.diagnosticDumps.push({ reasonCode, timestamp: Date.now() });
+    if (this.diagnosticDumps.length > this.MAX_DIAGNOSTIC_DUMPS) {
+      this.diagnosticDumps.shift();
+    }
+  }
+
+  // Phase 5: Aggregate diagnostic dumps into a <50 token strategic directive for LLM prompts
+  getStrategicDirectivesForLLM(): string {
+    if (this.diagnosticDumps.length === 0) return '';
+
+    const counts = new Map<string, number>();
+    for (const d of this.diagnosticDumps) {
+      counts.set(d.reasonCode, (counts.get(d.reasonCode) || 0) + 1);
+    }
+
+    const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+    const total = this.diagnosticDumps.length;
+    const top2 = sorted.slice(0, 2);
+
+    const top2Summary = top2.map(([code, count]) => {
+      const pct = Math.round((count / total) * 100);
+      const label = this.getReasonCodeLabel(code);
+      return `${pct}% ${label}`;
+    }).join(', ');
+
+    // Pivot suggestion based on most common failure
+    const pivot = this.getPivotSuggestion(top2[0]?.[0] || '');
+
+    const directive = `RECENT REJECTIONS: ${top2Summary}. PIVOT: ${pivot}`;
+    // Enforce <50 tokens (~300 chars) by truncating at last sentence boundary
+    if (directive.length > 300) {
+      const truncated = directive.substring(0, 295);
+      const lastPeriod = truncated.lastIndexOf('.');
+      return lastPeriod > 0 ? truncated.substring(0, lastPeriod + 1) : truncated + '.';
+    }
+    return directive;
+  }
+
+  private getReasonCodeLabel(code: string): string {
+    const labels: Record<string, string> = {
+      BLACKLISTED_PATTERN: 'blacklisted pattern',
+      DUPLICATE_FINGERPRINT: 'exact duplicates',
+      SEMANTIC_REDUNDANCY: 'semantic overlap',
+      SKELETON_OVERLAP: 'skeleton overlap',
+      CATEGORY_BUDGET_EXCEEDED: 'category budget full',
+      STYLE_BUDGET_EXCEEDED: 'style budget full',
+      REVERSAL_CAP_REACHED: 'reversal cap reached',
+      SYNTACTIC_OVERLAP: 'syntactic overlap',
+      FACTOR_SATURATION: 'factor saturation',
+      TIER1_SIMILARITY: 'pre-sim similarity',
+      BEHAVIORAL_OVERLAP: 'behavioral overlap',
+      TIER2_SIMILARITY: 'post-sim similarity',
+      POST_SIM_CORRELATION: 'post-sim correlation',
+      LOW_SHARPE: 'low Sharpe',
+      HIGH_TURNOVER: 'high turnover',
+      CHECK_FAILURE: 'check failure',
+      SYNTAX_ERROR: 'syntax errors',
+    };
+    return labels[code] || code;
+  }
+
+  private getPivotSuggestion(topReasonCode: string): string {
+    const pivots: Record<string, string> = {
+      FACTOR_SATURATION: 'Try different data domains or fundamental fields.',
+      SYNTACTIC_OVERLAP: 'Use different operator combinations or neutralization.',
+      BEHAVIORAL_OVERLAP: 'Explore new strategy styles outside current behavioral cluster.',
+      REVERSAL_CAP_REACHED: 'Focus on momentum or carry strategies instead of reversal.',
+      POST_SIM_CORRELATION: 'Diversify operator categories to reduce correlation.',
+      DUPLICATE_FINGERPRINT: 'Generate more structurally diverse expressions.',
+      LOW_SHARPE: 'Improve signal strength with stronger operators or better fields.',
+      HIGH_TURNOVER: 'Apply ts_decay_linear or humpdecay to reduce turnover.',
+      CATEGORY_BUDGET_EXCEEDED: 'Explore underrepresented alpha categories.',
+      STYLE_BUDGET_EXCEEDED: 'Rotate to a different style premia.',
+    };
+    return pivots[topReasonCode] || 'Diversify operators, fields, or data domains.';
   }
 
   private determineBehavioralCategory(expression: string): string {
@@ -1112,5 +1418,9 @@ export class DiversityManager {
     this.correlationFeedbackQueue = [];
     this.wqBaselineAlphaIds.clear();
     this.blacklistedPatternSignatures.clear();
+    // Phase 5: Clear new state
+    this.diagnosticDumps = [];
+    this.reversalAlphaCount = 0;
+    this.behavioralFingerprints.clear();
   }
 }

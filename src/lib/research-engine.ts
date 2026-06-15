@@ -668,9 +668,13 @@ export class ResearchEngine {
           continue;
         }
 
-        // Diversity Check — Layer 1: basic (fingerprint, semantic, category, style)
+        // Diversity Check — Layer 1: basic (fingerprint, semantic, category, style, Tier 1 formula)
         const basicDiversity = this.diversityManager.evaluateCandidate(candidate);
         if (!basicDiversity.accepted) {
+          // Phase 5: Record diagnostic dump for Tier 1 rejection
+          if (basicDiversity.reasonCode) {
+            this.diversityManager.recordDiagnosticDump(basicDiversity.reasonCode);
+          }
           this.emit({
             type: 'diversity_check',
             data: { candidateId: candidate.id, accepted: false, reasons: basicDiversity.reasons },
@@ -719,6 +723,8 @@ export class ResearchEngine {
         }
 
         if (correlationResult && !correlationResult.accepted) {
+          // Phase 5: Record diagnostic dump
+          this.diversityManager.recordDiagnosticDump('TIER2_SIMILARITY');
           this.emit({
             type: 'diversity_check',
             data: {
@@ -826,6 +832,21 @@ export class ResearchEngine {
             const reward = this.computeRewardFromAlpha(candidate, result.alpha);
             genRewardSum += reward.totalReward;
             genBestReward = Math.max(genBestReward, reward.totalReward);
+
+            // Phase 5: Tier 2 post-simulation evaluation (behavioral fingerprint check)
+            const tier2Result = this.diversityManager.evaluatePostSimulation(candidate, result.alpha);
+            if (!tier2Result.accepted) {
+              this.diversityManager.recordDiagnosticDump(tier2Result.reasonCode || 'TIER2_SIMILARITY');
+              candidate.status = 'failed';
+              candidate.error = tier2Result.reasons.join('; ');
+              this.state.candidateQueue.push(candidate);
+              this.logTrace('tier2_rejected', 'Candidate rejected by Tier 2 post-sim evaluation', candidate.id, {
+                score: tier2Result.score,
+                reasons: tier2Result.reasons,
+              });
+              continue;
+            }
+
             this.executeMiddleLoop(candidate, result.alpha);
             genSuccessful++;
             genSharpeSum += result.alpha.sharpe;
@@ -1023,6 +1044,9 @@ export class ResearchEngine {
       this.state.syntaxErrorBuffer = this.state.syntaxErrorBuffer.slice(-25);
     }
 
+    // Phase 5: Record diagnostic dump for validation failure
+    this.diversityManager.recordDiagnosticDump('SYNTAX_ERROR');
+
     // Attempt auto-correction via LLM
     if (this.state.config?.enableAutoCorrection) {
       this.autoCorrectExpression(candidate, result.errors).catch(() => {});
@@ -1088,6 +1112,7 @@ export class ResearchEngine {
     const hasCorrelationData = this.hasReportedCorrelationData(alpha);
     if (!hasCorrelationData) {
       const blacklistedPattern = this.diversityManager.blacklistExpressionPattern(candidate.expression);
+      this.diversityManager.recordDiagnosticDump('POST_SIM_CORRELATION');
       candidate.status = 'failed';
       candidate.error = 'Rejected post-simulation: missing correlation payload from platform';
       this.state.candidateQueue.push(candidate);
@@ -1110,6 +1135,7 @@ export class ResearchEngine {
       const topMatches = this.getTopCorrelationMatches(alpha);
       const blacklistedPattern = this.diversityManager.blacklistExpressionPattern(candidate.expression);
 
+      this.diversityManager.recordDiagnosticDump('POST_SIM_CORRELATION');
       candidate.status = 'failed';
       candidate.error = `Rejected post-simulation: correlation ${(maxReportedCorrelation * 100).toFixed(1)}% >= ${(hardCorrelationLimit * 100).toFixed(1)}%`;
       this.state.candidateQueue.push(candidate);
@@ -1196,13 +1222,18 @@ export class ResearchEngine {
     if (alpha.sharpe < thresholds.minSharpe && alpha.sharpe > 0.8) {
       modifications.push('Signal is weak - try amplifying with signed_power(x, 0.5) or ts_rank for stronger cross-sectional signal');
     }
+    if (alpha.sharpe < thresholds.minSharpe) {
+      this.diversityManager.recordDiagnosticDump('LOW_SHARPE');
+    }
     if (alpha.fitness < thresholds.minFitness) {
       modifications.push(`Fitness ${alpha.fitness.toFixed(3)} below ${thresholds.minFitness} - try adjusting lookback window or neutralization method`);
     }
     if (alpha.turnover > thresholds.maxTurnover) {
+      this.diversityManager.recordDiagnosticDump('HIGH_TURNOVER');
       modifications.push(`Turnover ${(alpha.turnover * 100).toFixed(1)}% exceeds ${(thresholds.maxTurnover * 100).toFixed(1)}% - apply ts_decay_linear(x, window) or humpdecay(x, halfLife)`);
     }
     if (alpha.checks.some(c => c.result === 'FAIL')) {
+      this.diversityManager.recordDiagnosticDump('CHECK_FAILURE');
       const failedChecks = alpha.checks.filter(c => c.result === 'FAIL').map(c => c.name);
       modifications.push(`Failed checks: ${failedChecks.join(', ')} - adjust expression to pass all platform checks`);
     }
@@ -1530,6 +1561,12 @@ Each hypothesis should be 1-2 sentences of plain English.`;
         prompt += '\n';
       }
 
+      // Phase 5: Strategic directives from diagnostic dump aggregation
+      const strategicDirectives = this.diversityManager.getStrategicDirectivesForLLM();
+      if (strategicDirectives) {
+        prompt += `## STRATEGIC DIRECTIVES\n${strategicDirectives}\n\n`;
+      }
+
       prompt += `Strategy: ${outerResult.strategy} | Mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%\n`;
       prompt += this.buildSourceGuidanceBlock(
        `hypothesis generation ${style} ${outerResult.strategy} ${styleConfig.datasets.join(' ')}`
@@ -1646,6 +1683,12 @@ Each hypothesis should be 1-2 sentences of plain English.`;
       if (syntaxContext) {
         prompt += syntaxContext;
         prompt += '\n';
+      }
+
+      // Phase 5: Strategic directives from diagnostic dump aggregation
+      const strategicDirectives = this.diversityManager.getStrategicDirectivesForLLM();
+      if (strategicDirectives) {
+        prompt += `## STRATEGIC DIRECTIVES\n${strategicDirectives}\n\n`;
       }
 
       prompt += `Translate each hypothesis into a complete FASTEXPR expression. Use ${styleConfig.datasets.join(', ')} data.\n`;
@@ -1872,6 +1915,12 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
       if (syntaxContext) {
         prompt += syntaxContext;
         prompt += '\n';
+      }
+
+      // Phase 5: Strategic directives from diagnostic dump aggregation
+      const strategicDirectives = this.diversityManager.getStrategicDirectivesForLLM();
+      if (strategicDirectives) {
+        prompt += `## STRATEGIC DIRECTIVES\n${strategicDirectives}\n\n`;
       }
 
       prompt += `## Strategy: ${outerResult.strategy} (mutation rate: ${(outerResult.mutationRate * 100).toFixed(0)}%)\n\n`;
@@ -2470,6 +2519,9 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
       // Diversity Check — Layer 1: basic
       const basicDiversity = this.diversityManager.evaluateCandidate(candidate);
       if (!basicDiversity.accepted) {
+        if (basicDiversity.reasonCode) {
+          this.diversityManager.recordDiagnosticDump(basicDiversity.reasonCode);
+        }
         this.emit({
           type: 'diversity_check',
           data: { candidateId: candidate.id, accepted: false, reasons: basicDiversity.reasons },
@@ -2511,6 +2563,7 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
             recommendation: correlationResult.pcaRecommendation,
           },
         });
+        this.diversityManager.recordDiagnosticDump('TIER2_SIMILARITY');
         this.state.candidateQueue.push({ ...candidate, status: 'discarded' });
         this.diversityManager.recordCorrelationRejection(candidate, correlationResult);
         continue;
@@ -2525,6 +2578,19 @@ Each expression should be a complete, valid FASTEXPR alpha formula.`;
 
       // Middle Loop: Analyze results
       if (simResult.alpha) {
+        // Phase 5: Tier 2 post-simulation evaluation
+        const tier2Result = this.diversityManager.evaluatePostSimulation(candidate, simResult.alpha);
+        if (!tier2Result.accepted) {
+          this.diversityManager.recordDiagnosticDump(tier2Result.reasonCode || 'TIER2_SIMILARITY');
+          candidate.status = 'failed';
+          candidate.error = tier2Result.reasons.join('; ');
+          this.state.candidateQueue.push(candidate);
+          this.logTrace('tier2_rejected', 'Polish queue candidate rejected by Tier 2', candidate.id, {
+            score: tier2Result.score,
+            reasons: tier2Result.reasons,
+          });
+          continue;
+        }
         this.executeMiddleLoop(candidate, simResult.alpha);
         this.addToExperienceBuffer(candidate, simResult.alpha);
         this.trackLineage(candidate, simResult.alpha);
